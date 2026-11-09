@@ -1,0 +1,4 @@
+# Binários: sem conversão de fim de linha (o autocrlf do Windows corromperia os PDFs)
+*.pdf binary
+*.png binary
+*.jpg binary
