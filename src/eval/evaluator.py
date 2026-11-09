@@ -464,7 +464,8 @@ TRECHOS:
             print(f"  {BOLD}[{i}/{len(qa_pairs)}]{RESET} {diff_icon} [{difficulty}] {query}")
 
             t0     = time.perf_counter()
-            chunks = retriever.search(query, top_k=self.top_k, rerank=True)
+            # Só o documento avaliado: a base agora guarda vários documentos
+            chunks = retriever.search(query, top_k=self.top_k, rerank=True, document_id=doc_id)
             total_latency += (time.perf_counter() - t0) * 1000
 
             texts      = [c["text"]      for c in chunks]
@@ -491,7 +492,7 @@ TRECHOS:
             answer           = ""
             answer_eval      = {}
             if evaluate_answer_quality and os.getenv("GROQ_API_KEY"):
-                raw_ctx = retriever.get_context(query, top_k=3)
+                raw_ctx = retriever.get_context(query, top_k=3, document_id=doc_id)
                 if len(raw_ctx) > 2500:
                     raw_ctx = raw_ctx[:2500] + "\n[contexto truncado]"
                 chain = LLMChain(max_tokens=400, stream=False)

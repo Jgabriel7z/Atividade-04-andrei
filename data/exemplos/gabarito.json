@@ -1,0 +1,39 @@
+{
+  "descricao": "Gabarito do conjunto de teste da Atividade 03: 3 documentos interligados, 10 referências cruzadas a artigos alterados e 5 alterações no Regulamento (v1 -> v2).",
+  "documentos": {
+    "regulamento": {"nome": "Regulamento Interno", "apelidos": ["Regulamento Interno", "Regulamento"], "v1": "regulamento_v1.txt", "v2": "regulamento_v2.txt"},
+    "contrato": {"nome": "Contrato Modelo", "apelidos": ["Contrato Modelo"], "v1": "contrato_modelo.txt"},
+    "manual": {"nome": "Manual do Colaborador", "apelidos": ["Manual do Colaborador", "Manual"], "v1": "manual.txt"}
+  },
+  "alteracoes": {
+    "alterados": ["3", "7", "12"],
+    "removidos": ["15"],
+    "incluidos": ["17"]
+  },
+  "referencias_cruzadas": [
+    {"documento": "contrato-modelo", "artigo": "3",  "trecho": "art. 3º do Regulamento Interno"},
+    {"documento": "contrato-modelo", "artigo": "7",  "trecho": "artigo 7º do Regulamento Interno"},
+    {"documento": "contrato-modelo", "artigo": "12", "trecho": "art. 12 do Regulamento, mediante"},
+    {"documento": "contrato-modelo", "artigo": "12", "trecho": "Regulamento Interno, art. 12, § 1º"},
+    {"documento": "contrato-modelo", "artigo": "15", "trecho": "Art. 15 do Regulamento Interno"},
+    {"documento": "manual-do-colaborador", "artigo": "3",  "trecho": "arts. 3º e 7º do Regulamento Interno"},
+    {"documento": "manual-do-colaborador", "artigo": "7",  "trecho": "arts. 3º e 7º do Regulamento Interno"},
+    {"documento": "manual-do-colaborador", "artigo": "3",  "trecho": "arts. 2º a 4º do Regulamento Interno"},
+    {"documento": "manual-do-colaborador", "artigo": "12", "trecho": "art. 12, § 2º, do Regulamento"},
+    {"documento": "manual-do-colaborador", "artigo": "15", "trecho": "artigo 15 do Regulamento"}
+  ],
+  "nao_devem_aparecer": [
+    {"documento": "contrato-modelo", "trecho": "art. 9º do Regulamento Interno", "motivo": "artigo não mudou"},
+    {"documento": "contrato-modelo", "trecho": "art. 12 do Código Civil", "motivo": "outro documento"},
+    {"documento": "manual-do-colaborador", "trecho": "art. 11 do Regulamento Interno", "motivo": "artigo não mudou"},
+    {"documento": "manual-do-colaborador", "trecho": "art. 12 do Código Civil e o Regulamento Interno", "motivo": "o art. 12 citado é o do Código Civil"},
+    {"documento": "manual-do-colaborador", "trecho": "art. 5º, garante", "motivo": "Constituição, não o Regulamento"}
+  ],
+  "trechos_dependentes": {
+    "_comentario": "Trechos de outros documentos que dependem dos artigos alterados ou removidos, citando ou não. Uma sugestão semântica é correta se a frase sugerida contém um destes trechos.",
+    "3":  ["A jornada do CONTRATADO segue", "O expediente vai das 8h às 17h", "Ver arts. 3º e 7º", "As regras gerais estão nos arts. 2º a 4º"],
+    "7":  ["direito a descanso anual remunerado", "As férias serão solicitadas conforme", "Planeje seu período de descanso anual", "Ver arts. 3º e 7º"],
+    "12": ["As despesas comprovadas feitas pelo CONTRATADO", "Aplicam-se as regras de prazo de entrega de comprovantes", "Guarde todas as notas fiscais", "Envie os comprovantes pelo sistema financeiro", "Atenção ao prazo previsto no art. 12"],
+    "15": ["O vale-transporte será concedido", "Quem usa ônibus ou metrô"]
+  }
+}

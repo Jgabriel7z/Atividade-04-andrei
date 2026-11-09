@@ -4,6 +4,11 @@
 
 ---
 
+> **Fork da Atividade 04 (UFPB, disciplina de Agentes).** Esta branch acrescenta o **histórico de versões de documentos com análise de impacto**: vários documentos na base, versões com autor, data, motivo e SHA-256, comparação por artigo, resumo da mudança pela LLM e aviso de quais trechos de outros documentos dependem dos artigos alterados.
+> Leia [docs/VERSIONAMENTO.md](docs/VERSIONAMENTO.md) (o que mudou, como rodar e testar), [docs/ANTES_E_DEPOIS.md](docs/ANTES_E_DEPOIS.md) e [docs/RELATORIO.md](docs/RELATORIO.md).
+
+---
+
 ## 🚀 Demonstração
 
 Interface interativa disponível via Gradio (execução local):

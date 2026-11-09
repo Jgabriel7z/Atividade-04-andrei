@@ -165,6 +165,54 @@ class LLMChain:
             logger.error(f"Erro ao fazer streaming: {str(e)}")
             raise
 
+    # ── Resumo de mudança entre versões ──────────────────────
+
+    SUMMARY_SYSTEM_PROMPT = (
+        "Você explica mudanças em documentos normativos (regulamentos, contratos, "
+        "manuais) para quem não é da área jurídica. Escreva em português do Brasil, "
+        "em frases curtas, uma por mudança, citando o artigo e os valores antes e "
+        "depois (ex.: 'O prazo do art. 12 caiu de 30 para 15 dias.'). "
+        "Fale só do que mudou. Não invente nada que não esteja nos textos."
+    )
+    MAX_SUMMARY_INPUT_CHARS = 10_000
+
+    def summarize_change(
+        self,
+        before: str,
+        after: str,
+        document_name: str = "documento",
+        changes_hint: str = "",
+    ) -> str:
+        """
+        Resume em linguagem simples o que mudou entre `before` e `after`.
+
+        Chamada avulsa: monta as mensagens à parte e NÃO usa nem altera
+        conversation_history, para o resumo não aparecer no chat.
+        `changes_hint` é o diff por artigo já calculado (versioning.VersionDiff.as_text),
+        que ajuda a LLM a não deixar mudança de fora.
+        """
+        half = self.MAX_SUMMARY_INPUT_CHARS // 2
+        user = (
+            f"Documento: {document_name}\n\n"
+            + (f"Diferenças detectadas automaticamente:\n{changes_hint[:2000]}\n\n" if changes_hint else "")
+            + f"TEXTO ANTES:\n{before[:half]}\n\nTEXTO DEPOIS:\n{after[:half]}\n\n"
+            "Resuma o que mudou."
+        )
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": self.SUMMARY_SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            max_completion_tokens=self.max_tokens,
+            top_p=self.top_p,
+            stream=False,
+        )
+        summary = response.choices[0].message.content.strip()
+        logger.info(f"Resumo de mudança gerado ({len(summary)} chars)")
+        return summary
+
 
 # ── Função auxiliar ──────────────────────────────────────────
 
