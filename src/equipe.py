@@ -6,7 +6,8 @@ O que permite várias pessoas usarem a mesma base ao mesmo tempo:
 - contas de acesso (login), lidas do .env;
 - conversa entre as pessoas: uma sala geral e uma sala por documento;
 - presença: quem está com o app aberto agora e o que está vendo;
-- atividade recente: versões publicadas e mensagens, numa linha do tempo só.
+- conversas com a IA: cada pergunta e resposta fica guardada, para a equipe ver;
+- atividade recente: versões publicadas, mensagens e perguntas à IA, numa linha do tempo só.
 
 Fica no mesmo SQLite do registro de versões (data/versions.db). Cada tela
 pergunta a cada poucos segundos se há novidade (ver `novidade`), em vez de o
@@ -15,6 +16,7 @@ servidor empurrar: é o que o Gradio permite sem servidor de mensagens.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -40,6 +42,18 @@ CREATE TABLE IF NOT EXISTS presenca (
     visto_em   TEXT NOT NULL,
     vendo      TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS ia_perguntas (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversa   TEXT NOT NULL,
+    autor      TEXT NOT NULL,
+    pergunta   TEXT NOT NULL,
+    resposta   TEXT NOT NULL,
+    escopo     TEXT NOT NULL DEFAULT '',
+    modelo     TEXT NOT NULL DEFAULT '',
+    fontes     TEXT NOT NULL DEFAULT '[]',
+    criado_em  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ia_perguntas_conversa ON ia_perguntas (conversa, id);
 CREATE TABLE IF NOT EXISTS leitura (
     usuario    TEXT NOT NULL,
     sala       TEXT NOT NULL,
@@ -80,6 +94,15 @@ def ler_contas(texto: Optional[str] = None) -> List[Conta]:
     return contas
 
 
+def ler_admins(texto: Optional[str] = None) -> set:
+    """
+    Logins com cargo de admin, do .env: EIXOAI_ADMINS=joao,luiz.
+    Só admin vê as conversas das outras pessoas com a IA.
+    """
+    texto = os.environ.get("EIXOAI_ADMINS", "") if texto is None else texto
+    return {t.strip() for t in texto.split(",") if t.strip()}
+
+
 # ── Registro ──────────────────────────────────────────────────
 
 @dataclass
@@ -92,11 +115,38 @@ class Mensagem:
 
 
 @dataclass
+class PerguntaIA:
+    id: int
+    pergunta: str
+    resposta: str
+    escopo: str
+    modelo: str
+    fontes: List[Dict]        # [{"documento", "pagina", "trecho"}]
+    criado_em: str
+
+
+@dataclass
+class ConversaIA:
+    """Uma conversa de uma pessoa com a IA (de abrir a página até 'Nova conversa')."""
+    id: str
+    autor: str
+    perguntas: List[PerguntaIA]
+
+    @property
+    def inicio(self) -> str:
+        return self.perguntas[0].criado_em
+
+    @property
+    def fim(self) -> str:
+        return self.perguntas[-1].criado_em
+
+
+@dataclass
 class Evento:
     """Uma linha da atividade recente."""
     quando: str
     quem: str
-    tipo: str          # "versao" | "mensagem"
+    tipo: str          # "versao" | "mensagem" | "ia"
     texto: str
     sala: str = ""     # documento ou sala da mensagem
 
@@ -144,6 +194,50 @@ class Equipe:
         with self._conn() as c:
             return c.execute("SELECT COALESCE(MAX(id), 0) AS m FROM mensagens").fetchone()["m"]
 
+    # conversas com a IA
+    def registrar_pergunta(self, conversa: str, autor: str, pergunta: str, resposta: str,
+                           escopo: str = "", modelo: str = "",
+                           fontes: Optional[List[Dict]] = None) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO ia_perguntas (conversa, autor, pergunta, resposta, escopo, modelo, "
+                "fontes, criado_em) VALUES (?,?,?,?,?,?,?,?)",
+                (conversa, autor or "Visitante", pergunta[:MAX_TEXTO], resposta, escopo, modelo,
+                 json.dumps(fontes or [], ensure_ascii=False), _agora().isoformat()))
+            return cur.lastrowid
+
+    def ultima_pergunta_ia(self) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT COALESCE(MAX(id), 0) AS m FROM ia_perguntas").fetchone()["m"]
+
+    def autores_ia(self) -> List[str]:
+        with self._conn() as c:
+            return [r["autor"] for r in c.execute(
+                "SELECT autor, MAX(id) AS u FROM ia_perguntas GROUP BY autor ORDER BY u DESC")]
+
+    def conversas_ia(self, autor: Optional[str] = None, limite: int = 30) -> List[ConversaIA]:
+        """Conversas com a IA, da mais recente para a mais antiga; `autor` filtra por pessoa."""
+        filtro, args = ("WHERE autor = ?", (autor,)) if autor else ("", ())
+        with self._conn() as c:
+            ids = [r["conversa"] for r in c.execute(
+                f"SELECT conversa, MAX(id) AS u FROM ia_perguntas {filtro} "
+                f"GROUP BY conversa ORDER BY u DESC LIMIT ?", (*args, limite))]
+            if not ids:
+                return []
+            marcas = ",".join("?" * len(ids))
+            rows = c.execute(f"SELECT * FROM ia_perguntas WHERE conversa IN ({marcas}) ORDER BY id",
+                             ids).fetchall()
+        por_id: Dict[str, ConversaIA] = {}
+        for r in rows:
+            conv = por_id.setdefault(r["conversa"], ConversaIA(r["conversa"], r["autor"], []))
+            try:
+                fontes = json.loads(r["fontes"])
+            except ValueError:
+                fontes = []
+            conv.perguntas.append(PerguntaIA(r["id"], r["pergunta"], r["resposta"], r["escopo"],
+                                             r["modelo"], fontes, r["criado_em"]))
+        return [por_id[i] for i in ids if i in por_id]
+
     # leitura: o que cada pessoa já viu de cada sala
     def marcar_lida(self, usuario: str, sala: str) -> None:
         with self._conn() as c:
@@ -182,7 +276,8 @@ class Equipe:
         return [(r["usuario"], r["vendo"]) for r in rows]
 
     # atividade: versões (do registro de versões) + mensagens
-    def atividade(self, limite: int = 30) -> List[Evento]:
+    def atividade(self, limite: int = 30, incluir_ia: bool = False) -> List[Evento]:
+        """Linha do tempo da equipe. Perguntas à IA só entram com incluir_ia (para admin)."""
         with self._conn() as c:
             tem_versoes = c.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='versions'").fetchone()
@@ -207,6 +302,11 @@ class Equipe:
                 trecho = r["texto"] if len(r["texto"]) <= 80 else r["texto"][:77] + "..."
                 eventos.append(Evento(r["criado_em"], r["autor"], "mensagem",
                                       f"escreveu {onde}: {trecho}", r["sala"]))
+            consulta_ia = "SELECT * FROM ia_perguntas ORDER BY id DESC LIMIT ?" if incluir_ia else                 "SELECT * FROM ia_perguntas WHERE 0 LIMIT ?"
+            for r in c.execute(consulta_ia, (limite,)):
+                trecho = r["pergunta"] if len(r["pergunta"]) <= 80 else r["pergunta"][:77] + "..."
+                eventos.append(Evento(r["criado_em"], r["autor"], "ia",
+                                      f"perguntou à IA: {trecho}", r["conversa"]))
         eventos.sort(key=lambda e: e.quando, reverse=True)
         return eventos[:limite]
 

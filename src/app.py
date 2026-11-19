@@ -24,6 +24,7 @@ import shutil
 import socket
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -36,7 +37,8 @@ from versioning import (
 )
 from impact import ImpactReport, analyze_impact, format_report, md_escape
 from busca import buscar
-from equipe import SALA_GERAL, Equipe, ler_contas, quando_humano
+from equipe import SALA_GERAL, Equipe, ler_admins, ler_contas, quando_humano
+from markdown_it import MarkdownIt
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -50,6 +52,7 @@ REFRESH_SECONDS = 3
 SECOES = ["Documento", "Mudanças", "Histórico", "Conversa"]
 
 CONTAS = ler_contas()
+ADMINS = ler_admins()
 NOMES = {c.login: c.nome for c in CONTAS}
 
 # ─── Recursos compartilhados entre sessões ────────────────────────────────────
@@ -89,6 +92,17 @@ def get_equipe() -> Equipe:
 def warm_up() -> None:
     """Carrega o modelo de embeddings em segundo plano assim que o app sobe."""
     threading.Thread(target=get_retriever, name="warm-up", daemon=True).start()
+
+
+def eh_admin(request: Optional[gr.Request]) -> bool:
+    """Admin (EIXOAI_ADMINS no .env) vê as conversas das outras pessoas com a IA."""
+    login = getattr(request, "username", None) if request else None
+    return bool(login) and login in ADMINS
+
+
+def exibir(nome: str) -> str:
+    """Nome para mostrar: 'Edital_Processo_PPGI' aparece como 'Edital Processo PPGI'."""
+    return " ".join(nome.replace("_", " ").split()) if nome else nome
 
 
 def quem(request: Optional[gr.Request]) -> str:
@@ -175,9 +189,13 @@ def _com_reserva(llm: LLMChain, tarefa):
         chain = llm if m == llm.model else _chain(llm, m)
         if chain is None or chain.model != m:
             continue
+        antes = len(chain.conversation_history)
         try:
             r = tarefa(chain)
         except Exception as e:
+            # generate_response põe a pergunta no histórico antes de chamar a API;
+            # se a chamada falha, ela sai, senão a próxima tentativa a duplicaria.
+            del chain.conversation_history[antes:]
             if not _no_limite(e):
                 raise
             tentados.append(m)
@@ -313,17 +331,18 @@ def _lista_docs() -> List[Tuple[str, str]]:
     out = []
     for d in get_store().list_documents():
         atual = get_store().get_current(d.id)
-        out.append((f"{d.name}  ·  v{atual.version}" if atual else d.name, d.id))
+        out.append((f"{exibir(d.name)}  ·  v{atual.version}" if atual else exibir(d.name), d.id))
     return out
 
 
 def _escopos() -> List[Tuple[str, str]]:
-    return [("Todos os documentos", ALL_DOCS)] + [(d.name, d.id) for d in get_store().list_documents()]
+    return [("Todos os documentos", ALL_DOCS)] + [(exibir(d.name), d.id)
+                                                  for d in get_store().list_documents()]
 
 
 def _destinos_envio() -> List[Tuple[str, str]]:
     return [("Um documento novo", NOVO_DOC)] + \
-           [(f"Nova versão de {d.name}", d.id) for d in get_store().list_documents()]
+           [(f"Nova versão de {exibir(d.name)}", d.id) for d in get_store().list_documents()]
 
 
 _MD_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
@@ -544,7 +563,7 @@ def _cabecalho_doc(doc_id: Optional[str]) -> str:
         return "<div class='doc-cab vazio'>Documento não encontrado.</div>"
     atual = next((v for v in vs if v.is_current), vs[-1])
     por = html.escape(atual.author or "alguém")
-    return (f"<div class='doc-cab'><div class='doc-nome'>{html.escape(d.name)}</div>"
+    return (f"<div class='doc-cab'><div class='doc-nome'>{html.escape(exibir(d.name))}</div>"
             f"<div class='suave'>Versão {atual.version} de {len(vs)} · atualizada "
             f"{quando_humano(atual.created_at)} por {por}"
             + (f" · {html.escape(atual.reason)}" if atual.reason else "") + "</div></div>")
@@ -634,8 +653,8 @@ def _online_html(eu: str) -> str:
     return "".join(linhas)
 
 
-def _atividade_html() -> str:
-    eventos = get_equipe().atividade(25)
+def _atividade_html(admin: bool = False) -> str:
+    eventos = get_equipe().atividade(25, incluir_ia=admin)
     if not eventos:
         return "<div class='suave'>Nada por enquanto. Envie um documento ou escreva na conversa.</div>"
     return "".join(
@@ -659,6 +678,11 @@ def _topo_html(eu: str) -> str:
 
 # ─── Perguntar ────────────────────────────────────────────────────────────────
 
+# 8 trechos e não 5: no edital do PPGI, "ate que dia eh a inscricao do mestrado" deixava
+# o item 1.1 (o período de inscrição) em 7º lugar, e a IA respondia que não havia a data.
+TRECHOS_POR_PERGUNTA = 8
+
+
 def _buscar(pergunta: str, llm: Optional[LLMChain], doc_filtro: Optional[str]) -> List[Dict]:
     """
     Busca híbrida (significado + palavras exatas, com correção de erro de
@@ -668,7 +692,8 @@ def _buscar(pergunta: str, llm: Optional[LLMChain], doc_filtro: Optional[str]) -
     isso piorava a busca (Hit@5 de 71,7% para 51,7% nas paráfrases).
     """
     reescrever = getattr(llm, "reescrever_pergunta", None) if llm else None
-    return buscar(get_retriever(), pergunta, document_id=doc_filtro, k=5, reescrever=reescrever)
+    return buscar(get_retriever(), pergunta, document_id=doc_filtro, k=TRECHOS_POR_PERGUNTA,
+                  reescrever=reescrever)
 
 
 def _fontes_html(resultados: List[Dict]) -> str:
@@ -697,23 +722,69 @@ SYSTEM_PROMPT = (
     "Você responde perguntas sobre os documentos de uma equipe (regulamentos, contratos, "
     "manuais, editais) para pessoas que não são da área jurídica. "
     "Use só o contexto fornecido. Escreva em português do Brasil, em frases curtas e "
-    "palavras simples, sem emoji. Diga de qual documento e de qual artigo veio a "
+    "palavras simples, sem emoji. Diga de qual documento e de qual artigo ou item veio a "
     "informação (ex.: 'Pelo Regulamento Interno, art. 12, ...'). "
-    "Se o contexto não tiver a resposta, diga isso claramente e sugira o que a pessoa "
-    "pode perguntar ou em qual documento procurar."
+    "Entenda a pergunta mesmo escrita de modo informal, sem acento ou com erro de digitação "
+    "('ate que dia eh a inscricao' = 'qual o prazo final das inscrições'). "
+    "Se o contexto não tiver a resposta, responda SOMENTE com duas linhas: na primeira, "
+    "exatamente [SEM_RESPOSTA]; na segunda, 'BUSCAR: ' e de 3 a 5 termos curtos separados "
+    "por ponto e vírgula, com as palavras que provavelmente aparecem no trecho do documento "
+    "que responde (sinônimos, nome da seção, por exemplo 'período de inscrição; cronograma')."
 )
+SEM_RESPOSTA = "[SEM_RESPOSTA]"
 MAX_CONTEXT_CHARS = 12_000
 
 
+def _sem_resposta(texto: str) -> bool:
+    return SEM_RESPOSTA in (texto or "")
+
+
+def _termos_sugeridos(texto: str) -> List[str]:
+    m = re.search(r"BUSCAR:\s*(.+)", texto or "", flags=re.S)
+    if not m:
+        return []
+    termos = [t.strip(" .\"'`") for t in re.split(r"[;\n]", m.group(1))]
+    return [t for t in termos if 2 < len(t) < 80][:5]
+
+
+def _desfazer_ultima_troca(llm: LLMChain) -> None:
+    """Tira do histórico a última pergunta e resposta (a tentativa que não achou)."""
+    h = llm.conversation_history
+    if len(h) >= 2 and h[-1]["role"] == "assistant" and h[-2]["role"] == "user":
+        del h[-2:]
+
+
+def _responder(llm: LLMChain, pergunta: str, contexto: str):
+    return _com_reserva(llm, lambda c: c.generate_response(
+        user_message=pergunta, system_prompt=SYSTEM_PROMPT, context=contexto[:MAX_CONTEXT_CHARS]))
+
+
+def _resumo_fontes(resultados: List[Dict]) -> List[Dict]:
+    nomes = {d.id: exibir(d.name) for d in get_store().list_documents()}
+    out = []
+    for r in resultados:
+        texto = " ".join(str(r.get("text", "")).split())
+        out.append({"documento": nomes.get(r.get("document_id"), str(r.get("source", ""))),
+                    "pagina": r.get("page"), "trecho": texto[:300]})
+    return out
+
+
 def perguntar(pergunta: str, historico: List[Dict], llm: Optional[LLMChain], modelo: str,
-              escopo: str):
+              escopo: str, conversa_id: Optional[str], request: gr.Request):
+    """
+    Busca, responde e, se a IA não achou a resposta nos trechos, tenta de novo:
+    ela devolve os termos que procuraria, o app busca esses termos, junta os
+    trechos novos e pergunta outra vez. Cada pergunta e resposta fica guardada
+    (equipe.py) para os admins verem as conversas da equipe com a IA.
+    """
     pergunta = (pergunta or "").strip()
     if not pergunta:
-        return "", historico, gr.skip(), llm
+        return "", historico, gr.skip(), llm, conversa_id
+    conversa_id = conversa_id or uuid.uuid4().hex
     llm = _chain(llm, modelo)
     doc_filtro = None if (not escopo or escopo == ALL_DOCS) else escopo
     fontes = ""
-    contexto = ""
+    resultados: List[Dict] = []
     if not get_store().has_documents():
         resposta = ("A base ainda está vazia. Envie um documento na aba Documentos e "
                     "depois pergunte aqui.")
@@ -721,19 +792,41 @@ def perguntar(pergunta: str, historico: List[Dict], llm: Optional[LLMChain], mod
     else:
         try:
             resultados = _buscar(pergunta, llm, doc_filtro)
-            fontes = _fontes_html(resultados)
-            contexto = get_retriever().format_context(resultados) if resultados else ""
         except Exception as e:
             logger.warning(f"Erro na busca: {e}")
             fontes = _aviso_erro(f"a busca falhou ({e}).")
+        contexto = get_retriever().format_context(resultados) if resultados else ""
+        extra = ""
         if llm is None:
             resposta = ("A IA não está disponível agora (falta a chave do Groq no arquivo .env). "
                         "Os trechos que respondem à pergunta estão ao lado.")
         else:
             try:
-                resposta, aviso = _com_reserva(llm, lambda c: c.generate_response(
-                    user_message=pergunta, system_prompt=SYSTEM_PROMPT,
-                    context=contexto[:MAX_CONTEXT_CHARS]))
+                resposta, aviso = _responder(llm, pergunta, contexto)
+                if _sem_resposta(resposta):
+                    termos = _termos_sugeridos(resposta)
+                    _desfazer_ultima_troca(llm)
+                    vistos = {r.get("id") for r in resultados}
+                    novos: List[Dict] = []
+                    for t in termos:
+                        for r in buscar(get_retriever(), t, document_id=doc_filtro, k=4):
+                            if r.get("id") not in vistos:
+                                vistos.add(r.get("id"))
+                                novos.append(r)
+                    if novos:
+                        resultados = resultados + novos[:6]
+                        contexto = get_retriever().format_context(resultados)
+                        resposta, aviso = _responder(llm, pergunta, contexto)
+                    if termos:
+                        extra = ("<div class='suave busca-extra'>Não achei de primeira; procurei "
+                                 "também por: " + html.escape("; ".join(termos)) + ".</div>")
+                    if _sem_resposta(resposta):
+                        resposta = ("Não encontrei essa informação nos documentos da base"
+                                    + (f" (procurei também por: {'; '.join(termos)})" if termos else "")
+                                    + ". Tente perguntar de outro jeito ou escolha um documento em "
+                                    "Procurar em.")
+                        if llm.conversation_history and llm.conversation_history[-1]["role"] == "assistant":
+                            llm.conversation_history[-1]["content"] = resposta
                 if aviso:
                     resposta += f"\n\n_{aviso}_"
             except IAOcupada:
@@ -744,15 +837,82 @@ def perguntar(pergunta: str, historico: List[Dict], llm: Optional[LLMChain], mod
                 logger.error(f"Erro na IA: {e}")
                 resposta = ("A IA não conseguiu responder agora. Os trechos encontrados estão ao "
                             "lado; tente de novo em instantes ou escolha outro modelo no topo.")
+        if not fontes:
+            fontes = extra + _fontes_html(resultados)
+    try:
+        nome_escopo = "Todos os documentos" if not doc_filtro else exibir(_nome_doc(doc_filtro))
+        get_equipe().registrar_pergunta(conversa_id, quem(request), pergunta, resposta,
+                                        escopo=nome_escopo, modelo=llm.model if llm else "",
+                                        fontes=_resumo_fontes(resultados))
+    except Exception as e:
+        logger.warning(f"Não deu para guardar a pergunta: {e}")
     historico = historico + [{"role": "user", "content": pergunta},
                              {"role": "assistant", "content": resposta}]
-    return "", historico, fontes, llm
+    return "", historico, fontes, llm, conversa_id
 
 
 def nova_conversa(llm):
     if llm is not None:
         llm.clear_history()
-    return [], "<div class='suave'>As fontes de cada resposta aparecem aqui.</div>", llm
+    return ([], "<div class='suave'>As fontes de cada resposta aparecem aqui.</div>", llm,
+            uuid.uuid4().hex)
+
+
+# ─── Conversas da equipe com a IA (só admin) ──────────────────────────────────
+
+_MD = MarkdownIt("commonmark", {"html": False}).enable("table").disable("image")
+VER_MINHA, VER_EQUIPE = "Minha conversa", "Conversas da equipe"
+
+
+def _conversas_ia_html(autor: str, eu: str) -> str:
+    convs = get_equipe().conversas_ia(autor or None)
+    if not convs:
+        return "<div class='suave'>Ninguém conversou com a IA ainda.</div>"
+    blocos = []
+    for c in convs:
+        n = len(c.perguntas)
+        primeira = c.perguntas[0].pergunta
+        primeira = primeira if len(primeira) <= 110 else primeira[:107] + "..."
+        voce = " (você)" if c.autor == eu else ""
+        itens = []
+        for q in c.perguntas:
+            fontes = "; ".join(dict.fromkeys(      # sem repetir o mesmo documento e página
+                f"{f.get('documento', '')}" + (f", p. {f['pagina']}" if f.get("pagina") not in (None, "", 0, "0") else "")
+                for f in q.fontes))
+            itens.append(
+                f"<div class='ia-item'><div class='suave'>{quando_humano(q.criado_em)} · "
+                f"{html.escape(q.escopo or 'Todos os documentos')} · {html.escape(_rotulo_modelo(q.modelo) if q.modelo else '')}</div>"
+                f"<div class='ia-pergunta'>{html.escape(q.pergunta)}</div>"
+                f"<div class='ia-resposta'>{_MD.render(q.resposta)}</div>"
+                + (f"<div class='suave ia-fontes'>Fontes: {html.escape(fontes)}</div>" if fontes else "")
+                + "</div>")
+        blocos.append(
+            f"<details class='conv-ia'><summary><span class='avatar'>{html.escape(_iniciais(c.autor))}</span>"
+            f"<div class='conv-topo'><div><b>{html.escape(c.autor)}{voce}</b> "
+            f"<span class='suave'>· {quando_humano(c.fim)} · {n} pergunta{'s' if n > 1 else ''}</span></div>"
+            f"<div class='conv-titulo'>{html.escape(primeira)}</div></div></summary>"
+            f"{''.join(itens)}</details>")
+    return "".join(blocos)
+
+
+def _filtro_pessoas() -> List[Tuple[str, str]]:
+    return [("Todas as pessoas", "")] + [(a, a) for a in get_equipe().autores_ia()]
+
+
+def mostrar_ver_ia(ver):
+    return gr.update(visible=ver != VER_EQUIPE), gr.update(visible=ver == VER_EQUIPE)
+
+
+def preencher_ia(ver, autor, request: gr.Request):
+    if ver != VER_EQUIPE:
+        return gr.skip(), gr.skip(), gr.skip()
+    if not eh_admin(request):       # confere no servidor, não só esconde o botão
+        return ("<div class='suave'>Só quem tem cargo de admin vê as conversas da equipe.</div>",
+                gr.skip(), gr.skip())
+    opcoes = _filtro_pessoas()
+    autor = autor if autor in [v for _, v in opcoes] else ""
+    return (_conversas_ia_html(autor, quem(request)), gr.update(choices=opcoes, value=autor),
+            get_equipe().ultima_pergunta_ia())
 
 # ─── Documentos: navegação, envio e comparação ────────────────────────────────
 
@@ -881,7 +1041,7 @@ def escrever_geral(texto, request: gr.Request):
     get_equipe().enviar(SALA_GERAL, eu, texto)
     get_equipe().marcar_lida(eu, SALA_GERAL)
     return "", _conversa_html(SALA_GERAL, eu, "Ninguém escreveu ainda. Comece a conversa."), \
-        _atividade_html()
+        _atividade_html(eh_admin(request))
 
 
 def escrever_doc(texto, doc_id, request: gr.Request):
@@ -913,6 +1073,8 @@ def ao_abrir(request: gr.Request):
         envio_destino: gr.update(choices=_destinos_envio(), value=NOVO_DOC),
         visto_versao: get_store().last_change(),
         visto_msg: get_equipe().ultima_mensagem(),
+        conversa_state: uuid.uuid4().hex,
+        ver_ia: gr.update(visible=eh_admin(request), value=VER_MINHA),
     }
 
 
@@ -940,11 +1102,11 @@ def abrir_equipe(request: gr.Request):
     get_equipe().sinal(eu, "Na conversa da equipe")
     get_equipe().marcar_lida(eu, SALA_GERAL)
     return ("equipe", _conversa_html(SALA_GERAL, eu, "Ninguém escreveu ainda. Comece a conversa."),
-            _online_html(eu), _atividade_html(), _topo_html(eu))
+            _online_html(eu), _atividade_html(eh_admin(request)), _topo_html(eu))
 
 
 def a_cada_instante(v_visto, m_visto, mine, aba_atual, doc_id, sec, escopo_atual, topo_antes,
-                    online_antes, request: gr.Request):
+                    online_antes, ver, autor_ia, ia_visto, request: gr.Request):
     """
     Roda a cada REFRESH_SECONDS em cada tela aberta: dá sinal de presença,
     avisa o que os outros fizeram e atualiza só a aba aberta.
@@ -983,10 +1145,17 @@ def a_cada_instante(v_visto, m_visto, mine, aba_atual, doc_id, sec, escopo_atual
         out[topo] = novo_topo
         out[topo_cache] = novo_topo
 
-    if aba_atual == "perguntar" and mudou_v:
-        ids = [v for _, v in _escopos()]
-        out[escopo] = gr.update(choices=_escopos(),
-                                value=escopo_atual if escopo_atual in ids else ALL_DOCS)
+    admin = eh_admin(request)
+    ia_ultima = eq.ultima_pergunta_ia()
+    if aba_atual == "perguntar":
+        if mudou_v:
+            ids = [v for _, v in _escopos()]
+            out[escopo] = gr.update(choices=_escopos(),
+                                    value=escopo_atual if escopo_atual in ids else ALL_DOCS)
+        if admin and ver == VER_EQUIPE and ia_ultima != ia_visto:
+            out[ia_lista] = _conversas_ia_html(autor_ia or "", eu)
+            out[ia_filtro] = gr.update(choices=_filtro_pessoas())
+            out[ia_visto_state] = ia_ultima
     elif aba_atual == "documentos":
         if mudou_v:
             out[doc_lista] = gr.update(choices=_lista_docs())
@@ -1004,8 +1173,9 @@ def a_cada_instante(v_visto, m_visto, mine, aba_atual, doc_id, sec, escopo_atual
         if mudou_m:
             eq.marcar_lida(eu, SALA_GERAL)
             out[geral_conversa] = _conversa_html(SALA_GERAL, eu, "Ninguém escreveu ainda. Comece a conversa.")
-        if mudou_v or mudou_m:
-            out[atividade] = _atividade_html()
+        if mudou_v or mudou_m or (admin and ia_ultima != ia_visto):
+            out[atividade] = _atividade_html(admin)
+            out[ia_visto_state] = ia_ultima
         novo_online = _online_html(eu)
         if novo_online != online_antes:
             out[quem_aqui] = novo_online
@@ -1093,7 +1263,27 @@ button[role="tab"][aria-selected="true"] {{ color: var(--texto) !important;
 /* Documentos */
 #doc-lista {{ max-height: calc(100vh - 470px); min-height: 140px; overflow-y: auto; }}
 #doc-lista .wrap {{ flex-direction: column !important; gap: 4px !important; }}
-#doc-lista label {{ width: 100% !important; justify-content: flex-start; }}
+#doc-lista label {{ width: 100% !important; justify-content: flex-start; min-width: 0; }}
+#doc-lista label span {{ overflow-wrap: anywhere; word-break: break-word; white-space: normal; }}
+#doc-lista, #doc-lista .wrap {{ overflow-x: hidden !important; }}
+#ver-ia {{ margin-bottom: 6px; }}
+#ia-lista {{ height: calc(100vh - 290px); min-height: 360px; overflow-y: auto; padding-right: 6px; }}
+.conv-ia {{ border: 1px solid var(--linha); border-radius: 10px; margin-bottom: 8px; background: {PAINEL}; }}
+.conv-ia summary {{ display: flex; gap: 10px; align-items: flex-start; padding: 10px 14px; cursor: pointer;
+                    list-style: none; }}
+.conv-ia summary::-webkit-details-marker {{ display: none; }}
+.conv-ia[open] summary {{ border-bottom: 1px solid var(--linha); }}
+.conv-topo {{ min-width: 0; }}
+.conv-titulo {{ color: #CFDCDF; font-size: 14px; overflow-wrap: anywhere; }}
+.ia-item {{ padding: 10px 14px; border-top: 1px solid var(--linha); }}
+.ia-item:first-of-type {{ border-top: 0; }}
+.ia-pergunta {{ font-weight: 500; margin: 4px 0; padding: 6px 10px; border-radius: 8px;
+                border: 1px solid rgba(61,219,195,.35); background: rgba(61,219,195,.06);
+                display: inline-block; max-width: 100%; overflow-wrap: anywhere; }}
+.ia-resposta {{ font-size: 14px; line-height: 1.55; overflow-wrap: anywhere; }}
+.ia-resposta p {{ margin: 6px 0; }}
+.ia-fontes {{ margin-top: 4px; }}
+.busca-extra {{ margin-bottom: 8px; }}
 .doc-cab {{ padding: 2px 0 6px; }}
 .doc-cab.vazio {{ color: var(--suave); padding: 24px 0; }}
 .doc-nome {{ font-family: 'Clash Display', 'General Sans', sans-serif; font-size: 22px; font-weight: 500; }}
@@ -1137,6 +1327,8 @@ with gr.Blocks(title="EixoAI") as demo:
     topo_cache = gr.State("")
     online_cache = gr.State("")
     pendente_state = gr.State(None)     # mudanças já calculadas, esperando a seção aparecer
+    conversa_state = gr.State(None)     # id da conversa atual com a IA (muda em "Nova conversa")
+    ia_visto_state = gr.State(0)        # última pergunta à IA que a lista da equipe já mostrou
 
     with gr.Row(elem_id="linha-topo", equal_height=True):
         topo = gr.HTML(_topo_html("Visitante"), elem_id="topo")
@@ -1148,7 +1340,17 @@ with gr.Blocks(title="EixoAI") as demo:
     with gr.Tabs():
         # ── Perguntar ────────────────────────────────────────────────────────
         with gr.Tab("Perguntar") as tab_perguntar:
-            with gr.Row():
+            ver_ia = gr.Radio([VER_MINHA, VER_EQUIPE], value=VER_MINHA, show_label=False,
+                              container=False, visible=False, elem_id="ver-ia")
+            with gr.Row(visible=False) as linha_equipe_ia:
+                with gr.Column(scale=1, min_width=220):
+                    ia_filtro = gr.Dropdown(label="De quem", choices=[("Todas as pessoas", "")],
+                                            value="")
+                    gr.HTML("<div class='suave'>Só quem tem cargo de admin vê esta lista. "
+                            "Clique numa conversa para abrir.</div>")
+                with gr.Column(scale=4):
+                    ia_lista = gr.HTML("", elem_id="ia-lista")
+            with gr.Row(visible=True) as linha_minha:
                 with gr.Column(scale=3):
                     chat = gr.Chatbot(show_label=False, elem_id="chat-ia",
                                       placeholder="Pergunte qualquer coisa sobre os documentos da "
@@ -1244,10 +1446,15 @@ with gr.Blocks(title="EixoAI") as demo:
 
     # Perguntar
     for gatilho in (btn_perguntar.click, pergunta.submit):
-        gatilho(perguntar, inputs=[pergunta, chat, llm_state, modelo, escopo],
-                outputs=[pergunta, chat, fontes, llm_state], show_progress="minimal")
-    btn_nova.click(nova_conversa, inputs=[llm_state], outputs=[chat, fontes, llm_state],
-                   show_progress="hidden")
+        gatilho(perguntar, inputs=[pergunta, chat, llm_state, modelo, escopo, conversa_state],
+                outputs=[pergunta, chat, fontes, llm_state, conversa_state], show_progress="minimal")
+    btn_nova.click(nova_conversa, inputs=[llm_state],
+                   outputs=[chat, fontes, llm_state, conversa_state], show_progress="hidden")
+    ia_args = dict(fn=preencher_ia, inputs=[ver_ia, ia_filtro],
+                   outputs=[ia_lista, ia_filtro, ia_visto_state], show_progress="hidden")
+    ver_ia.input(mostrar_ver_ia, inputs=[ver_ia], outputs=[linha_minha, linha_equipe_ia],
+                 show_progress="hidden", queue=False).then(**ia_args)
+    ia_filtro.input(**ia_args)
 
     # Documentos
     painel = [doc_cab, doc_pdf, doc_texto, doc_hist, cmp_a, cmp_b, doc_conversa,
@@ -1257,7 +1464,8 @@ with gr.Blocks(title="EixoAI") as demo:
                           inputs=[secao, doc_lista, pendente_state, modelo, llm_state],
                           outputs=painel + [pendente_state, llm_state], show_progress="minimal")
     demo.load(ao_abrir, inputs=None,
-              outputs=[topo, modelo, escopo, doc_lista, envio_destino, visto_versao, visto_msg],
+              outputs=[topo, modelo, escopo, doc_lista, envio_destino, visto_versao, visto_msg,
+                       conversa_state, ver_ia],
               show_progress="hidden").then(**preencher_args)
     doc_lista.input(**preencher_args)
     secao.input(mostrar_secao, inputs=[secao], outputs=secoes, show_progress="hidden",
@@ -1298,10 +1506,10 @@ with gr.Blocks(title="EixoAI") as demo:
     relogio.tick(
         a_cada_instante,
         inputs=[visto_versao, visto_msg, mine_state, aba, doc_lista, secao, escopo, topo_cache,
-                online_cache],
+                online_cache, ver_ia, ia_filtro, ia_visto_state],
         outputs=[visto_versao, visto_msg, topo, topo_cache, escopo, doc_lista, envio_destino,
                  doc_cab, doc_pdf, doc_texto, doc_hist, cmp_a, cmp_b, doc_conversa, geral_conversa,
-                 atividade, quem_aqui, online_cache],
+                 atividade, quem_aqui, online_cache, ia_lista, ia_filtro, ia_visto_state],
         show_progress="hidden",
         concurrency_limit=None,      # consulta rápida; não espera na fila dos envios
     )

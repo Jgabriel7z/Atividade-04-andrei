@@ -91,6 +91,20 @@ Também: o modelo original do projeto, `llama-3.3-70b-versatile`, saiu do Groq. 
 - **Login** com as contas do `.env` (`EIXOAI_USUARIOS=login:senha:Nome`). O nome de quem enviou cada versão e escreveu cada mensagem vem do login: ninguém publica no nome do outro. Sem a variável, o app abre sem login.
 - O terminal mostra os endereços para a equipe entrar (rede local e VPN).
 
+### 10. Perguntas escritas de outro jeito (segundo teste do Luiz)
+No edital, "qual o periodo de inscricoes" achava o item 1.1 ("03 a 07 de novembro"), mas "ate que dia eh a inscricao do mestrado" não achava: a IA respondia que o trecho fornecido não tinha a data e sugeria procurar "Calendário" ou "Prazos". Medido na base do teste: o item 1.1 ficava em 4º lugar sem a reescrita da IA e em 7º com ela, e só os 5 primeiros iam para a IA. Em "qual o prazo pra me inscrever no mestrado", ele nem entrava nos 10 primeiros.
+
+Duas mudanças:
+- **8 trechos** para a IA em vez de 5 (os do edital têm uns 570 caracteres).
+- **Segunda tentativa:** quando o contexto não tem a resposta, a IA devolve os termos que procuraria (por exemplo "período de inscrição; cronograma"). O app busca esses termos, junta os trechos novos e pergunta de novo. Só custa uma chamada a mais quando a primeira não acha. Se nem assim achar, a resposta diz que não encontrou e quais termos procurou.
+
+Na base do teste, as cinco formas da pergunta passaram a responder "03 a 07 de novembro de 2026, até 23:59 (item 1.1)": "ate que dia eh a inscricao do mestrado", "qual o prazo pra me inscrever no mestrado", "quando acaba a inscrição?", "qual o periodo de inscricoes" e "data limite de inscrição".
+
+Também: quando a IA falhava no limite do Groq e o app tentava outro modelo, a pergunta ficava duas vezes no histórico; corrigido.
+
+### 11. Conversas da equipe com a IA (só admin)
+Cada pergunta à IA e sua resposta ficam guardadas (`equipe.py`, tabela `ia_perguntas`), com quem perguntou, a conversa a que pertence (de abrir a página até "Nova conversa"), o modelo e as fontes. Quem tem cargo de admin (`EIXOAI_ADMINS` no `.env`) vê, na aba Perguntar, a opção **Conversas da equipe**: a lista de conversas (quem, quando, quantas perguntas e a primeira pergunta), que abre a conversa inteira com as fontes, filtro por pessoa e atualização em tempo real. Na Atividade recente, "perguntou à IA" também só aparece para admin. A permissão é conferida no servidor, não só escondendo o botão. Conferido com duas contas (uma admin, outra não).
+
 ## Conferência com o plano da Atividade 03
 
 | Item do plano | Situação |
