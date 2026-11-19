@@ -1189,14 +1189,24 @@ with gr.Blocks(title="EixoAI") as demo:
 
 
 def _enderecos(porta: int) -> List[str]:
-    """Endereços desta máquina na rede (Wi-Fi, VPN), para a equipe entrar."""
-    ips = set()
+    """Endereços desta máquina em cada placa de rede (Wi-Fi, VPN), para a equipe entrar."""
+    achados: Dict[str, str] = {}
     try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ips.add(info[4][0])
-    except OSError:
-        pass
-    return [f"http://{ip}:{porta}" for ip in sorted(ips) if not ip.startswith("127.")]
+        import psutil                   # vem com as dependências; lista também a VPN
+        for placa, ends in psutil.net_if_addrs().items():
+            for e in ends:
+                if e.family == socket.AF_INET:
+                    achados.setdefault(e.address, placa)
+    except Exception:
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                achados.setdefault(info[4][0], "")
+        except OSError:
+            pass
+    # 127.x é a própria máquina; 169.254.x é endereço automático, sem rede de verdade.
+    return [f"http://{ip}:{porta}" + (f"  ({placa})" if placa else "")
+            for ip, placa in sorted(achados.items())
+            if not ip.startswith(("127.", "169.254."))]
 
 
 if __name__ == "__main__":
