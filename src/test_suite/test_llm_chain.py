@@ -24,7 +24,8 @@ def test_llm_chain() -> Tuple[int, int]:
 
     def t_init_default():
         chain = LLMChain()
-        assert chain.model == "llama-3.3-70b-versatile"
+        from llm_chain import DEFAULT_MODEL
+        assert chain.model == DEFAULT_MODEL
         assert chain.temperature == 0.7
         assert chain.max_tokens  == 1024
         assert chain.conversation_history == []
@@ -104,7 +105,7 @@ def test_llm_chain() -> Tuple[int, int]:
         if not os.getenv("GROQ_API_KEY"):
             print(_warn("   GROQ_API_KEY não configurada — pulando teste de API real"))
             return
-        chain = LLMChain(max_tokens=50, stream=False)
+        chain = LLMChain(max_tokens=300, stream=False)   # o gpt-oss raciocina antes de responder; 50 dava texto vazio
         response = chain.generate_response(
             "Diga apenas: 'Teste OK'",
             system_prompt="Responda exatamente o que pedir, nada mais."

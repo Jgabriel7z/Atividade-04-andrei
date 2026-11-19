@@ -1,18 +1,40 @@
+"""
+EixoAI — documentos e versões de uma equipe, com perguntas respondidas pela IA.
+
+Três abas:
+  Perguntar   chat com a IA sobre a versão atual dos documentos;
+  Documentos  lista para navegar, texto atual, mudanças, histórico, conversa
+              sobre cada documento e envio de arquivos (documento novo ou
+              versão nova);
+  Equipe      conversa geral, quem está aqui e atividade recente.
+
+Várias pessoas usam a mesma base ao mesmo tempo. Cada tela pergunta a cada
+REFRESH_SECONDS se surgiu versão ou mensagem nova (gr.Timer) e atualiza só a
+aba aberta: no Gradio 6.3, componente de aba oculta que recebe atualização
+fica preso com o "carregando" por cima quando a aba aparece.
+"""
+
 import gradio as gr
 import html
 import inspect
 import logging
+import os
 import re
+import socket
 import threading
+import time
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
 from ingester import extract_text_from_pdf
-from llm_chain import LLMChain
+from llm_chain import DEFAULT_MODEL, LLMChain
 from retriever import DocumentRetriever
 from versioning import (
-    VersionStore, VersionDiff, compare_versions, publish_version, sha256_file, unified_diff,
+    VersionStore, VersionDiff, compare_versions, publish_version, sha256_file, split_articles,
 )
 from impact import ImpactReport, analyze_impact, format_report, md_escape
+from busca import buscar
+from equipe import SALA_GERAL, Equipe, ler_contas, quando_humano
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,19 +43,28 @@ UPLOAD_DIR = Path("../data/uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 ALL_DOCS = "__todos__"
+NOVO_DOC = "__novo__"
+REFRESH_SECONDS = 3
+SECOES = ["Texto atual", "Mudanças", "Histórico", "Conversa"]
 
-# Recursos compartilhados entre sessões: o modelo de embeddings, o ChromaDB e o
-# registro de versões. O que é de cada usuário (histórico do chat, documento
-# escolhido) fica em gr.State, não em variável global.
+CONTAS = ler_contas()
+NOMES = {c.login: c.nome for c in CONTAS}
+
+# ─── Recursos compartilhados entre sessões ────────────────────────────────────
+# O modelo de embeddings, o ChromaDB, o registro de versões e a conversa da
+# equipe são de todos. O que é de cada pessoa (histórico do chat com a IA,
+# modelo escolhido, aba aberta) fica em gr.State.
+
 _retriever: Optional[DocumentRetriever] = None
 _store: Optional[VersionStore] = None
+_equipe: Optional[Equipe] = None
 _retriever_lock = threading.Lock()
 
 
 def get_retriever() -> DocumentRetriever:
     global _retriever
     if _retriever is None:
-        with _retriever_lock:          # o warm_up e um upload podem chegar juntos
+        with _retriever_lock:          # o warm_up e um envio podem chegar juntos
             if _retriever is None:
                 _retriever = DocumentRetriever()
     return _retriever
@@ -46,167 +77,251 @@ def get_store() -> VersionStore:
     return _store
 
 
+def get_equipe() -> Equipe:
+    global _equipe
+    if _equipe is None:
+        _equipe = Equipe(get_store().db_path)     # mesmo SQLite das versões
+    return _equipe
+
+
 def warm_up() -> None:
-    """
-    Carrega o modelo de embeddings em segundo plano assim que o app sobe.
-    Antes, o primeiro upload esperava o carregamento (9–15 s nesta máquina).
-    """
+    """Carrega o modelo de embeddings em segundo plano assim que o app sobe."""
     threading.Thread(target=get_retriever, name="warm-up", daemon=True).start()
 
-# ─── Paleta: vermelho, preto e branco ─────────────────────────────────────────
 
-BLACK = "#0a0a0a"       # fundo
-PANEL = "#141414"       # blocos
-BORDER = "#2e2e2e"
-WHITE = "#fafafa"
-MUTED = "#a3a3a3"
-RED = "#dc2626"
-RED_LIGHT = "#f87171"
-RED_BG = "#1f0707"
-MONO = "font-family: 'JetBrains Mono', monospace; font-size: 13px;"
+def quem(request: Optional[gr.Request]) -> str:
+    """Nome de quem está usando: vem do login. Sem login configurado, 'Visitante'."""
+    login = getattr(request, "username", None) if request else None
+    return NOMES.get(login, login) if login else "Visitante"
 
+# ─── Modelos do Groq ──────────────────────────────────────────────────────────
 
-def _box(border: str, bg: str, body: str, dashed: bool = False, width: str = "1.5px") -> str:
-    style = "dashed" if dashed else "solid"
-    return (f"<div style='display:flex;flex-direction:column;gap:6px;padding:14px 18px;"
-            f"border-radius:10px;background:{bg};border:{width} {style} {border};"
-            f"color:{WHITE};{MONO}'>{body}</div>")
-
-
-def _dot(color: str, glow: bool = False) -> str:
-    shadow = f"box-shadow:0 0 6px {color}aa;" if glow else ""
-    return (f"<span style='display:inline-block;width:10px;height:10px;border-radius:50%;"
-            f"background:{color};{shadow}margin-right:10px;flex-shrink:0'></span>")
-
-# ─── HTML dos estados de status ────────────────────────────────────────────────
-
-def _status_idle() -> str:
-    return _box(BORDER, PANEL,
-                f"<div style='display:flex;align-items:center'>{_dot('#525252')}"
-                f"<span style='color:{MUTED}'>Nenhum PDF carregado — faça upload para começar</span></div>",
-                dashed=True)
+_MODELOS_CONHECIDOS = {
+    "openai/gpt-oss-120b": "GPT-OSS 120B · mais completo",
+    "openai/gpt-oss-20b": "GPT-OSS 20B · mais rápido",
+    "qwen/qwen3.8-27b": "Qwen 3.8 27B · equilibrado",
+    "llama-3.3-70b-versatile": "Llama 3.3 70B",
+    "llama-3.1-8b-instant": "Llama 3.1 8B · instantâneo",
+}
+# Modelos de áudio e de moderação não respondem perguntas.
+_NAO_CONVERSAM = ("whisper", "guard", "orpheus", "tts", "playai", "safeguard", "distil")
+_modelos_cache: Tuple[float, List[Tuple[str, str]]] = (0.0, [])
 
 
-def _status_loading() -> str:
-    return f"""
-    <style>
-    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-    @keyframes pulse-text {{ 0%,100% {{ opacity: 1; }} 50% {{ opacity: 0.55; }} }}
-    </style>
-    <div style="display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;
-                background:{PANEL};border:1.5px solid {RED};{MONO}">
-        <div style="width:16px;height:16px;border-radius:50%;border:2.5px solid {RED}44;
-                    border-top-color:{RED};animation:spin 0.8s linear infinite;flex-shrink:0"></div>
-        <span style="color:{WHITE};animation:pulse-text 1.4s ease-in-out infinite;">
-            Processando PDF e gerando embeddings…
-        </span>
-    </div>
+def modelos_disponiveis() -> List[Tuple[str, str]]:
+    """(rótulo, id) dos modelos de conversa da conta do Groq; consulta a cada 10 min."""
+    global _modelos_cache
+    quando, lista = _modelos_cache
+    if lista and time.time() - quando < 600:
+        return lista
+    ids: List[str] = []
+    try:
+        from groq import Groq
+        ids = [m.id for m in Groq(timeout=8).models.list().data
+               if not any(p in m.id.lower() for p in _NAO_CONVERSAM)]
+    except Exception as e:
+        logger.warning(f"Não deu para listar os modelos do Groq: {e}")
+    if DEFAULT_MODEL not in ids:
+        ids.insert(0, DEFAULT_MODEL)
+    conhecidos = [i for i in _MODELOS_CONHECIDOS if i in ids]
+    outros = sorted(i for i in ids if i not in _MODELOS_CONHECIDOS)
+    lista = [(_MODELOS_CONHECIDOS.get(i, i), i) for i in conhecidos + outros]
+    _modelos_cache = (time.time(), lista)
+    return lista
+
+
+def _chain(llm: Optional[LLMChain], modelo: Optional[str]) -> Optional[LLMChain]:
+    """LLMChain da sessão no modelo escolhido; troca de modelo mantém a conversa."""
+    modelo = modelo or DEFAULT_MODEL
+    if llm is not None and llm.model == modelo:
+        return llm
+    try:
+        novo = LLMChain(model=modelo, stream=False)
+        # Sem as novas tentativas automáticas do cliente (esperavam 10 s ou mais
+        # no limite por minuto): no limite, troca de modelo (ver _com_reserva).
+        novo.client = novo.client.with_options(max_retries=0, timeout=60)
+    except Exception as e:
+        logger.warning(f"IA indisponível: {e}")
+        return llm
+    if llm is not None:
+        novo.conversation_history = list(llm.conversation_history)
+    return novo
+
+
+def _rotulo_modelo(modelo_id: str) -> str:
+    return dict((i, r) for r, i in modelos_disponiveis()).get(modelo_id, modelo_id).split(" · ")[0]
+
+
+def _no_limite(e: Exception) -> bool:
+    t = str(e).lower()
+    return "rate_limit" in t or "rate limit" in t or "error code: 429" in t
+
+
+class IAOcupada(Exception):
+    """Todos os modelos tentados estão no limite de uso por minuto do Groq."""
+
+
+def _com_reserva(llm: LLMChain, tarefa):
     """
+    Roda tarefa(chain) no modelo escolhido. Se ele bateu no limite de uso por
+    minuto da conta do Groq (comum na conta gratuita, com várias pessoas ao
+    mesmo tempo), tenta até dois outros modelos. Devolve (resultado, aviso).
+    """
+    tentados = []
+    ids = [llm.model] + [i for _, i in modelos_disponiveis() if i != llm.model]
+    for m in ids[:3]:
+        chain = llm if m == llm.model else _chain(llm, m)
+        if chain is None or chain.model != m:
+            continue
+        try:
+            r = tarefa(chain)
+        except Exception as e:
+            if not _no_limite(e):
+                raise
+            tentados.append(m)
+            continue
+        if chain is not llm:
+            llm.conversation_history = chain.conversation_history
+        aviso = "" if not tentados else (
+            f"O modelo {_rotulo_modelo(tentados[0])} chegou ao limite de uso por minuto; "
+            f"esta resposta veio do {_rotulo_modelo(m)}.")
+        return r, aviso
+    raise IAOcupada()
+
+# ─── Paleta ───────────────────────────────────────────────────────────────────
+# Azul petróleo bem escuro, texto quase branco, verde-água nos destaques e
+# amarelo para pedir atenção. Linhas finas, cantos de 10 px, sem emoji.
+
+FUNDO = "#081C25"
+PAINEL = "#0B2530"
+PAINEL_2 = "#0E2C38"
+LINHA = "rgba(238, 243, 240, .14)"
+LINHA_FORTE = "rgba(238, 243, 240, .32)"
+TEXTO = "#EEF3F0"
+SUAVE = "#9FB4B9"
+DESTAQUE = "#3DDBC3"
+DESTAQUE_TINTA = "#04141A"
+ATENCAO = "#F4C542"
+ERRO = "#FF6B6B"
 
 
-def _status_ready(filename: str, chunks: int, chars: int, extra: str = "") -> str:
-    return _box(WHITE, PANEL,
-                f"<div style='display:flex;align-items:center'>{_dot(RED, glow=True)}"
-                f"<span style='font-weight:600'>PDF pronto — pode enviar mensagens</span></div>"
-                f"<div style='display:flex;gap:16px;padding-left:20px;color:{MUTED};font-size:11px'>"
-                f"<span>📄 {html.escape(filename)}</span><span>·</span>"
-                f"<span>🧩 {chunks} chunks</span><span>·</span>"
-                f"<span>📝 {chars:,} caracteres</span></div>{extra}")
+def _caixa(corpo: str, cor: str = LINHA, fundo: str = PAINEL) -> str:
+    return (f"<div class='caixa' style='border-color:{cor};background:{fundo}'>{corpo}</div>")
 
 
-def _status_error(msg: str) -> str:
-    return _box(RED, RED_BG,
-                f"<div style='display:flex;align-items:center'>{_dot(RED)}"
-                f"<span>{html.escape(msg)}</span></div>")
+def _aviso_erro(msg: str) -> str:
+    return _caixa(f"<b style='color:{ERRO}'>Não foi possível concluir.</b> {html.escape(msg)}",
+                  cor=ERRO)
 
 
-def _status_base(n_docs: int, n_chunks: int) -> str:
-    return _box(WHITE, PANEL,
-                f"<div style='display:flex;align-items:center'>{_dot(RED, glow=True)}"
-                f"<span>📚 <b>{n_docs}</b> documento(s) na base · 🧩 {n_chunks} chunks vigentes — "
-                f"pode enviar mensagens</span></div>")
+def _aviso_ok(msg: str) -> str:
+    return _caixa(html.escape(msg), cor=DESTAQUE)
 
 
-def _note(text: str) -> str:
-    return f"<div style='padding-left:20px;color:{MUTED};font-size:11px'>{text}</div>"
-
-
-def _alert(diff: Optional[VersionDiff], impact: Optional[ImpactReport], name: str,
-           old_v: Optional[int], new_v: int) -> str:
-    """Faixa de aviso que aparece quando um documento muda."""
-    name = html.escape(name)
-    if old_v is None or diff is None:
-        return _box(WHITE, PANEL, f"<div>📄 <b>{name}</b> entrou na base (versão {new_v}).</div>")
-    n_chg = len([c for c in diff.changed if c.key != "preambulo"])
-    parts = []
+def _alerta_mudanca(diff: Optional[VersionDiff], impact: Optional[ImpactReport], nome: str,
+                    v_antes: Optional[int], v_depois: int) -> str:
+    """Faixa que aparece quando um documento muda: o que mudou e quem é afetado."""
+    nome = html.escape(nome)
+    if v_antes is None or diff is None:
+        return _caixa(f"<b>{nome}</b> foi adicionado à base (versão {v_depois}).", cor=DESTAQUE)
+    n_alt = len([c for c in diff.changed if c.key != "preambulo"])
+    partes = []
     if not diff.structured:
-        parts.append("texto alterado (documento sem artigos)")
-    elif n_chg:
-        parts.append(f"{n_chg} artigo(s) alterado(s)")
+        partes.append("o texto mudou (documento sem artigos)")
+    elif n_alt:
+        partes.append(f"{n_alt} artigo{'s' if n_alt > 1 else ''} mudou" if n_alt == 1
+                      else f"{n_alt} artigos mudaram")
     if diff.removed:
-        parts.append(f"{len(diff.removed)} removido(s)")
+        partes.append(f"{len(diff.removed)} saiu" if len(diff.removed) == 1
+                      else f"{len(diff.removed)} saíram")
     if diff.added:
-        parts.append(f"{len(diff.added)} incluído(s)")
-    what = ", ".join(parts) or "só mudanças fora dos artigos"
-    n_direct = len(impact.direct) if impact else 0
-    n_sug = len(impact.suggestions) if impact else 0
+        partes.append(f"{len(diff.added)} entrou" if len(diff.added) == 1
+                      else f"{len(diff.added)} entraram")
+    oque = ", ".join(partes) or "só mudou o cabeçalho"
+    n_cita = len(impact.direct) if impact else 0
+    n_pode = len(impact.suggestions) if impact else 0
     docs = sorted({c.document_name for c in impact.direct}) if impact else []
-    head = f"<b>{name}</b> mudou (v{old_v} → v{new_v}): {what}."
-    if n_direct or n_sug:
-        body = (f"<div style='font-size:14px'>⚠️ {head}</div>"
-                f"<div><b style='color:{RED_LIGHT}'>{n_direct}</b> trecho(s) em {len(docs)} outro(s) "
-                f"documento(s) citam esses artigos ({html.escape(', '.join(docs)) or '—'}); "
-                f"<b style='color:{RED_LIGHT}'>{n_sug}</b> sugestão(ões) por semelhança. "
-                f"Veja a lista abaixo.</div>")
-        return _box(RED, RED_BG, body, width="2px")
-    return _box(WHITE, PANEL, f"<div>✅ {head}</div>"
-                f"<div style='color:{MUTED}'>Nenhum outro documento da base depende dos artigos alterados.</div>")
+    topo = f"<div class='alerta-titulo'><b>{nome}</b> mudou da versão {v_antes} para a {v_depois}: {oque}.</div>"
+    if n_cita or n_pode:
+        linhas = []
+        if n_cita:
+            linhas.append(f"<b>{n_cita}</b> trecho{'s' if n_cita > 1 else ''} em "
+                          f"{html.escape(', '.join(docs))} cita{'m' if n_cita > 1 else ''} "
+                          f"diretamente o que mudou.")
+        if n_pode:
+            linhas.append(f"<b>{n_pode}</b> trecho{'s' if n_pode > 1 else ''} "
+                          f"pode{'m' if n_pode > 1 else ''} depender do que mudou.")
+        corpo = topo + "".join(f"<div>{l}</div>" for l in linhas) + \
+            "<div class='suave'>Confira a lista abaixo antes de usar esses documentos.</div>"
+        return _caixa(corpo, cor=ATENCAO, fundo="rgba(244,197,66,.07)")
+    return _caixa(topo + "<div class='suave'>Nenhum outro documento da base depende do que mudou.</div>",
+                  cor=DESTAQUE)
 
 
-# Tema: preto de fundo, texto branco, vermelho nos destaques. Os valores
-# "_dark" repetem os claros para a página ficar igual em qualquer navegador.
-def _theme() -> gr.themes.Base:
+def _tema() -> gr.themes.Base:
     t = gr.themes.Base(
-        primary_hue=gr.themes.colors.red,
-        secondary_hue=gr.themes.colors.red,
-        neutral_hue=gr.themes.colors.neutral,
-        font=[gr.themes.GoogleFont("Inter"), "system-ui", "sans-serif"],
+        primary_hue=gr.themes.colors.teal,
+        secondary_hue=gr.themes.colors.teal,
+        neutral_hue=gr.themes.colors.slate,
+        font=["General Sans", "Segoe UI", "system-ui", "sans-serif"],
         font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "monospace"],
+        radius_size=gr.themes.sizes.radius_md,
     )
-    values = dict(
-        body_background_fill=BLACK, body_text_color=WHITE, body_text_color_subdued=MUTED,
-        background_fill_primary=BLACK, background_fill_secondary=PANEL,
-        block_background_fill=PANEL, block_border_color=BORDER, block_border_width="1px",
-        block_label_background_fill=RED, block_label_text_color=WHITE,
-        block_title_text_color=WHITE, block_info_text_color=MUTED,
-        border_color_primary=BORDER, border_color_accent=RED,
-        color_accent=RED, color_accent_soft=RED_BG,
-        input_background_fill="#1c1c1c", input_border_color=BORDER,
-        input_border_color_focus=RED, input_placeholder_color="#737373",
-        button_primary_background_fill=RED, button_primary_background_fill_hover="#b91c1c",
-        button_primary_text_color=WHITE, button_primary_border_color=RED,
-        button_secondary_background_fill="#1c1c1c", button_secondary_background_fill_hover="#262626",
-        button_secondary_text_color=WHITE, button_secondary_border_color=BORDER,
-        link_text_color=RED_LIGHT, link_text_color_hover=WHITE,
-        table_even_background_fill=PANEL, table_odd_background_fill="#101010",
-        table_border_color=BORDER, checkbox_label_background_fill=PANEL,
-        panel_background_fill=PANEL, panel_border_color=BORDER,
+    valores = dict(
+        body_background_fill=FUNDO, body_text_color=TEXTO, body_text_color_subdued=SUAVE,
+        background_fill_primary=FUNDO, background_fill_secondary=PAINEL,
+        block_background_fill=PAINEL, block_border_color=LINHA, block_border_width="1px",
+        block_label_background_fill=PAINEL, block_label_text_color=SUAVE,
+        block_label_border_color=LINHA, block_title_text_color=TEXTO, block_info_text_color=SUAVE,
+        block_shadow="none", border_color_primary=LINHA, border_color_accent=DESTAQUE,
+        color_accent=DESTAQUE, color_accent_soft="rgba(61,219,195,.14)",
+        input_background_fill=FUNDO, input_border_color=LINHA,
+        input_border_color_focus=DESTAQUE, input_placeholder_color="#6E8E94",
+        input_shadow="none", input_shadow_focus="none",
+        button_primary_background_fill=DESTAQUE, button_primary_background_fill_hover="#5FE6D1",
+        button_primary_text_color=DESTAQUE_TINTA, button_primary_border_color=DESTAQUE,
+        button_secondary_background_fill="transparent",
+        button_secondary_background_fill_hover="rgba(238,243,240,.06)",
+        button_secondary_text_color=TEXTO, button_secondary_border_color=LINHA_FORTE,
+        button_shadow="none", button_shadow_hover="none",
+        link_text_color=DESTAQUE, link_text_color_hover=TEXTO,
+        table_even_background_fill=PAINEL, table_odd_background_fill=PAINEL_2,
+        table_border_color=LINHA, checkbox_label_background_fill=PAINEL,
+        checkbox_background_color_selected=DESTAQUE, checkbox_border_color_selected=DESTAQUE,
+        panel_background_fill=PAINEL, panel_border_color=LINHA,
+        code_background_fill=FUNDO,
     )
-    accepted = inspect.signature(t.set).parameters
-    t.set(**values, **{f"{k}_dark": v for k, v in values.items() if f"{k}_dark" in accepted})
+    aceitos = inspect.signature(t.set).parameters
+    t.set(**{k: v for k, v in valores.items() if k in aceitos},
+          **{f"{k}_dark": v for k, v in valores.items() if f"{k}_dark" in aceitos})
     return t
 
 
-THEME = _theme()
+THEME = _tema()
 
-# ─── Versões: registro, comparação, resumo e impacto ──────────────────────────
+# ─── Documentos e versões ─────────────────────────────────────────────────────
 
-def _doc_choices() -> List[Tuple[str, str]]:
-    return [(d.name, d.id) for d in get_store().list_documents()]
+def _nome_doc(doc_id: Optional[str]) -> str:
+    d = get_store().get_document(doc_id) if doc_id else None
+    return d.name if d else ""
 
 
-def _scope_choices() -> List[Tuple[str, str]]:
-    return [("Todos os documentos", ALL_DOCS)] + _doc_choices()
+def _lista_docs() -> List[Tuple[str, str]]:
+    """Itens da lista de documentos: 'Nome · versão N'."""
+    out = []
+    for d in get_store().list_documents():
+        atual = get_store().get_current(d.id)
+        out.append((f"{d.name}  ·  v{atual.version}" if atual else d.name, d.id))
+    return out
+
+
+def _escopos() -> List[Tuple[str, str]]:
+    return [("Todos os documentos", ALL_DOCS)] + [(d.name, d.id) for d in get_store().list_documents()]
+
+
+def _destinos_envio() -> List[Tuple[str, str]]:
+    return [("Um documento novo", NOVO_DOC)] + \
+           [(f"Nova versão de {d.name}", d.id) for d in get_store().list_documents()]
 
 
 _MD_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
@@ -219,572 +334,887 @@ def _fence(text: str, lang: str = "") -> str:
     return f"{f}{lang}\n{text}\n{f}"
 
 
-def _summarize(diff: VersionDiff, name: str, llm: Optional[LLMChain]) -> Tuple[str, bool]:
+def _resumir(diff: VersionDiff, nome: str, llm: Optional[LLMChain]) -> Tuple[str, bool]:
     """
-    Resumo pela LLM só com os artigos que mudaram; sem LLM, o resumo do diff.
-    Devolve (texto, veio_da_llm): só o resumo da LLM é gravado no histórico,
-    para não ficar preso ao resumo reserva depois que a chave for configurada.
+    Resumo pela IA só com os artigos que mudaram; sem IA, o resumo automático.
+    Devolve (texto, veio_da_ia): só o resumo da IA é gravado no histórico, para
+    não ficar preso ao resumo reserva depois que a chave for configurada.
     """
     if not diff.has_changes:
-        return "Nenhuma diferença de conteúdo entre as versões.", False
-    before = "\n\n".join([c.before for c in diff.changed] + [a.text for a in diff.removed])
-    after = "\n\n".join([c.after for c in diff.changed] + [a.text for a in diff.added])
+        return "As duas versões têm o mesmo conteúdo.", False
+    antes = "\n\n".join([c.before for c in diff.changed] + [a.text for a in diff.removed])
+    depois = "\n\n".join([c.after for c in diff.changed] + [a.text for a in diff.added])
     try:
-        chain = llm or LLMChain(stream=False)
-        text = chain.summarize_change(before, after, name, diff.as_text())
-        # Um PDF pode tentar induzir a LLM a pôr imagem externa no resumo.
-        return _MD_IMAGE.sub("", text), True
+        chain = llm or _chain(None, DEFAULT_MODEL)
+        texto, _ = _com_reserva(chain, lambda c: c.summarize_change(antes, depois, nome, diff.as_text()))
+        # Um PDF pode tentar induzir a IA a pôr imagem externa no resumo.
+        return _MD_IMAGE.sub("", texto), True
     except Exception as e:
-        logger.warning(f"Resumo pela LLM falhou, usando o diff: {e}")
-        return ("_Resumo automático (sem LLM — confira a GROQ_API_KEY):_\n\n"
-                + "\n".join(f"- {md_escape(line)}" for line in diff.as_text().splitlines()),
-                False)
+        logger.warning(f"Resumo pela IA falhou, usando o automático: {e}")
+        return ("_Resumo automático (a IA não respondeu):_\n\n"
+                + "\n".join(f"- {md_escape(l)}" for l in diff.as_text().splitlines()), False)
 
 
-def _diff_markdown(diff: Optional[VersionDiff]) -> str:
+def _mudancas_md(diff: Optional[VersionDiff]) -> str:
+    """O que mudou, artigo por artigo, com o texto de antes e de depois."""
     if diff is None:
-        return "_Primeira versão: não há com o que comparar._"
+        return "_Primeira versão: ainda não há com o que comparar._"
     if not diff.has_changes:
         return "_As duas versões têm o mesmo conteúdo._"
-    out = [f"**{len(diff.changed)} alterado(s) · {len(diff.removed)} removido(s) · "
-           f"{len(diff.added)} incluído(s) · {diff.unchanged} sem mudança**", ""]
+    out = []
     for c in diff.changed:
-        out.append(f"#### ✏️ {c.label} — alterado (semelhança {c.similarity:.0%})")
-        out.append(md_escape(c.edits_text()))
-        out.append(_fence(unified_diff(c.before, c.after, c.label), "diff"))
+        out.append(f"**{c.label}: mudou**")
+        trocas = c.edits_text()
+        if trocas:
+            out.append(md_escape(trocas))
+        out.append("Antes:\n\n> " + md_escape(" ".join(c.before.split())))
+        out.append("Depois:\n\n> " + md_escape(" ".join(c.after.split())))
     for a in diff.removed:
-        out.append(f"#### ➖ {a.label} — removido")
+        out.append(f"**{a.label}: saiu**")
         out.append("> " + md_escape(" ".join(a.text.split())))
     for a in diff.added:
-        out.append(f"#### ➕ {a.label} — incluído")
+        out.append(f"**{a.label}: entrou**")
         out.append("> " + md_escape(" ".join(a.text.split())))
     return "\n\n".join(out)
 
 
-def _history_rows(doc_id: Optional[str]) -> List[List]:
-    if not doc_id:
-        return []
-    return [
-        [v.version, v.created_at.replace("T", " "), v.author or "—", v.reason or "—",
-         v.filename, v.sha256[:12], v.n_chunks, "✅" if v.is_current else ""]
-        for v in get_store().list_versions(doc_id)
-    ]
+def _verificador(llm: Optional[LLMChain]):
+    """
+    Verificação por IA das sugestões da análise de impacto ("este trecho
+    depende mesmo do artigo que mudou?"). Sem IA, None: vale só a regra local.
+    """
+    if llm is None or not hasattr(llm, "verify_dependency"):
+        return None
+    return llm.verify_dependency
 
 
-def _version_choices(doc_id: Optional[str]) -> List[Tuple[str, int]]:
-    if not doc_id:
-        return []
-    return [(f"v{v.version} — {v.created_at[:10]} — {v.author or 'sem autor'}", v.version)
-            for v in get_store().list_versions(doc_id)]
+def _analisar_impacto(doc_id: str, diff: VersionDiff, llm: Optional[LLMChain]) -> ImpactReport:
+    verificar = _verificador(llm)
+    params = inspect.signature(analyze_impact).parameters
+    if verificar is not None and "verificar" in params:
+        return analyze_impact(get_store(), get_retriever(), doc_id, diff, verificar=verificar)
+    return analyze_impact(get_store(), get_retriever(), doc_id, diff)
 
 
-def _register(file, name: str, author: str, reason: str, aliases: str,
-              llm: Optional[LLMChain]):
-    """Registra o PDF como versão nova e calcula diff, resumo e impacto."""
-    file_path = file.get("name") if isinstance(file, dict) else file
-    text = extract_text_from_pdf(str(file_path))
-    if not text:
-        raise ValueError("PDF sem texto — pode ser um arquivo escaneado ou corrompido.")
-    filename = Path(file_path).name
+def _nome_legivel(arquivo_nome: str) -> str:
+    """'regulamento_v1.pdf' -> 'Regulamento'; 'Edital_PPGI_2027.pdf' -> 'Edital PPGI 2027'."""
+    base = re.sub(r"[_\-]+", " ", Path(arquivo_nome).stem)
+    base = re.sub(r"\s+(v|versao|versão|rev)\s*\d+$", "", base, flags=re.I).strip()
+    return (base[:1].upper() + base[1:]) if base else Path(arquivo_nome).stem
+
+
+def _registrar(arquivo, destino: str, nome_novo: str, autor: str, motivo: str, apelidos: str,
+               llm: Optional[LLMChain]):
+    """Registra o PDF como versão nova e calcula as mudanças, o resumo e o impacto."""
+    caminho = arquivo.get("name") if isinstance(arquivo, dict) else arquivo
+    texto = extract_text_from_pdf(str(caminho))
+    if not texto:
+        raise ValueError("o PDF não tem texto que dê para ler (pode ser uma imagem escaneada).")
+    arquivo_nome = Path(caminho).name
     store = get_store()
-    # O nome digitado pode ser o id de um documento existente (valor do dropdown).
-    existing = store.get_document(name) if name else None
-    display = existing.name if existing else (name or Path(filename).stem)
-    alias_list = [a.strip() for a in (aliases or "").split(",") if a.strip()]
+    existente = store.get_document(destino) if destino and destino != NOVO_DOC else None
+    nome = existente.name if existente else ((nome_novo or "").strip() or _nome_legivel(arquivo_nome))
+    lista_apelidos = [a.strip() for a in (apelidos or "").split(",") if a.strip()]
 
     res = publish_version(
-        store, get_retriever(), name=display, text=text, filename=filename,
-        sha256=sha256_file(file_path), author=author or "", reason=reason or "",
-        aliases=[display] + alias_list, document_id=existing.id if existing else None,
+        store, get_retriever(), name=nome, text=texto, filename=arquivo_nome,
+        sha256=sha256_file(caminho), author=autor or "", reason=(motivo or "").strip(),
+        aliases=[nome] + lista_apelidos, document_id=existente.id if existente else None,
     )
-    impact = summary = None
+    impacto = resumo = None
     if res.status == "created" and res.diff is not None:
-        impact = analyze_impact(store, get_retriever(), res.document.id, res.diff)
-        summary, from_llm = _summarize(res.diff, res.document.name, llm)
-        if from_llm:
-            store.set_summary(res.document.id, res.version.version, summary)
-    return res, impact, summary, len(text)
+        impacto = _analisar_impacto(res.document.id, res.diff, llm)
+        resumo, da_ia = _resumir(res.diff, res.document.name, llm)
+        if da_ia:
+            store.set_summary(res.document.id, res.version.version, resumo)
+    return res, impacto, resumo
 
 
-def upload_version(file, name, author, reason, aliases, llm):
-    """Aba Versões: enviar nova versão com autor e motivo."""
-    if file is None:
-        return (_status_error("Selecione um PDF."), "", "", "", gr.update(), gr.update(), llm)
-    try:
-        res, impact, summary, _ = _register(file, name, author, reason, aliases, llm)
-    except Exception as e:
-        logger.error(f"Erro ao registrar versão: {e}")
-        return (_status_error(f"Erro: {e}"), "", "", "", gr.update(), gr.update(), llm)
-
-    doc = res.document
-    if res.status == "unchanged":
-        alert = _status_error(f"Arquivo idêntico à versão vigente de {doc.name} "
-                              f"(v{res.version.version}, mesmo SHA-256). Nenhuma versão criada.")
-        summary_md = diff_md = impact_md = ""
-    else:
-        old_v = res.previous.version if res.previous else None
-        alert = _alert(res.diff, impact, doc.name, old_v, res.version.version)
-        summary_md = summary or "_Primeira versão._"
-        diff_md = _diff_markdown(res.diff)
-        impact_md = format_report(impact) if impact else "_Primeira versão: nada a verificar._"
-    choices = _doc_choices()
-    return (alert, summary_md, diff_md, impact_md,
-            gr.update(choices=choices, value=doc.id),
-            gr.update(choices=choices, value=doc.id), llm)
+def _texto_atual_md(doc_id: Optional[str]) -> str:
+    """Texto da versão atual, com cada artigo em destaque, para ler na tela."""
+    if not doc_id:
+        return ""
+    atual = get_store().get_current(doc_id)
+    if atual is None:
+        return "_Sem versão registrada._"
+    texto = get_store().get_version(doc_id, atual.version).text
+    artigos = split_articles(texto)
+    if len(artigos) <= 1:
+        return "\n\n".join(md_escape(l.strip()) for l in texto.splitlines() if l.strip())
+    out = []
+    for a in artigos:
+        corpo = " ".join(a.text.split())
+        rotulo = a.label if a.key != "preambulo" else ""
+        if rotulo and corpo.startswith("Art."):
+            # "Art. 12. O reembolso..." -> rótulo em negrito, resto normal
+            cab, _, resto = corpo.partition(" ")
+            num, _, resto = resto.partition(" ")
+            out.append(f"**{md_escape(cab + ' ' + num)}** {md_escape(resto)}")
+        else:
+            out.append(md_escape(corpo))
+    return "\n\n".join(out)
 
 
-def show_history(doc_id):
-    vs = _version_choices(doc_id)
-    a = vs[-2][1] if len(vs) > 1 else (vs[0][1] if vs else None)
-    b = vs[-1][1] if vs else None
-    return (_history_rows(doc_id), gr.update(choices=vs, value=a), gr.update(choices=vs, value=b))
+def _cabecalho_doc(doc_id: Optional[str]) -> str:
+    if not doc_id:
+        return ("<div class='doc-cab vazio'>Escolha um documento na lista, ou envie o primeiro "
+                "arquivo em <b>Enviar arquivo</b>.</div>")
+    store = get_store()
+    d = store.get_document(doc_id)
+    vs = store.list_versions(doc_id)
+    if d is None or not vs:
+        return "<div class='doc-cab vazio'>Documento não encontrado.</div>"
+    atual = next((v for v in vs if v.is_current), vs[-1])
+    por = html.escape(atual.author or "alguém")
+    return (f"<div class='doc-cab'><div class='doc-nome'>{html.escape(d.name)}</div>"
+            f"<div class='suave'>Versão {atual.version} de {len(vs)} · atualizada "
+            f"{quando_humano(atual.created_at)} por {por}"
+            + (f" · {html.escape(atual.reason)}" if atual.reason else "") + "</div></div>")
 
 
-def compare_selected(doc_id, va, vb, llm):
-    if not doc_id or va is None or vb is None:
-        return "_Escolha o documento e as duas versões._", "", "", llm
+def _historico(doc_id: Optional[str]) -> List[List]:
+    if not doc_id:
+        return []
+    return [[f"v{v.version}" + (" (atual)" if v.is_current else ""),
+             quando_humano(v.created_at), v.author or "—", v.reason or "—", v.filename,
+             v.sha256[:12]]
+            for v in reversed(get_store().list_versions(doc_id))]
+
+
+def _versoes_escolha(doc_id: Optional[str]) -> List[Tuple[str, int]]:
+    if not doc_id:
+        return []
+    return [(f"Versão {v.version} · {quando_humano(v.created_at)} · {v.author or 'sem autor'}",
+             v.version) for v in get_store().list_versions(doc_id)]
+
+
+def _comparar(doc_id: str, va: int, vb: int, llm: Optional[LLMChain]):
+    """(alerta, resumo, impacto, mudanças) entre duas versões já registradas."""
     store = get_store()
     a, b = store.get_version(doc_id, int(va)), store.get_version(doc_id, int(vb))
     if a is None or b is None:
-        return "_Versão não encontrada._", "", "", llm
+        return _aviso_erro("versão não encontrada."), "", "", ""
     diff = compare_versions(a.text, b.text)
     if b.change_summary and a.version == b.version - 1:
-        summary = b.change_summary                        # já gerado no envio
+        resumo = b.change_summary                       # já gerado no envio
     else:
-        summary, from_llm = _summarize(diff, store.get_document(doc_id).name, llm)
-        if from_llm and a.version == b.version - 1:
-            store.set_summary(doc_id, b.version, summary)
-    impact = analyze_impact(store, get_retriever(), doc_id, diff)
-    return summary, _diff_markdown(diff), format_report(impact), llm
+        resumo, da_ia = _resumir(diff, store.get_document(doc_id).name, llm)
+        if da_ia and a.version == b.version - 1:
+            store.set_summary(doc_id, b.version, resumo)
+    impacto = _analisar_impacto(doc_id, diff, llm)
+    alerta = _alerta_mudanca(diff, impacto, store.get_document(doc_id).name, a.version, b.version)
+    return alerta, resumo, format_report(impacto), _mudancas_md(diff)
 
-# ─── Chat ─────────────────────────────────────────────────────────────────────
+# ─── Conversa da equipe ───────────────────────────────────────────────────────
 
-def start_processing(file):
+def _iniciais(nome: str) -> str:
+    partes = [p for p in re.split(r"\s+", nome.strip()) if p]
+    return (partes[0][0] + (partes[1][0] if len(partes) > 1 else "")).upper() if partes else "?"
+
+
+def _conversa_html(sala: str, eu: str, vazio: str) -> str:
+    msgs = get_equipe().conversa(sala)
+    if not msgs:
+        return f"<div class='conversa'><div class='conversa-vazia'>{html.escape(vazio)}</div></div>"
+    itens = []
+    for m in reversed(msgs):          # a lista é column-reverse: fica rolada no fim
+        minha = " minha" if m.autor == eu else ""
+        itens.append(
+            f"<div class='msg{minha}'><div class='msg-topo'><span class='avatar'>"
+            f"{html.escape(_iniciais(m.autor))}</span><b>{html.escape(m.autor)}</b>"
+            f"<span class='suave'>{quando_humano(m.criado_em)}</span></div>"
+            f"<div class='msg-texto'>{html.escape(m.texto)}</div></div>")
+    return f"<div class='conversa'>{''.join(itens)}</div>"
+
+
+def _online_html(eu: str) -> str:
+    pessoas = get_equipe().online()
+    if not pessoas:
+        return "<div class='suave'>Ninguém por aqui agora.</div>"
+    linhas = []
+    for nome, vendo in pessoas:
+        voce = " (você)" if nome == eu else ""
+        linhas.append(f"<div class='pessoa'><span class='ponto'></span><span class='avatar'>"
+                      f"{html.escape(_iniciais(nome))}</span><div><b>{html.escape(nome)}{voce}</b>"
+                      f"<div class='suave'>{html.escape(vendo or 'com o app aberto')}</div></div></div>")
+    return "".join(linhas)
+
+
+def _atividade_html() -> str:
+    eventos = get_equipe().atividade(25)
+    if not eventos:
+        return "<div class='suave'>Nada por enquanto. Envie um documento ou escreva na conversa.</div>"
+    return "".join(
+        f"<div class='evento {e.tipo}'><span class='suave'>{quando_humano(e.quando)}</span>"
+        f"<div><b>{html.escape(e.quem)}</b> {html.escape(e.texto)}</div></div>" for e in eventos)
+
+
+def _topo_html(eu: str) -> str:
+    pessoas = get_equipe().online()
+    chips = "".join(
+        f"<span class='chip' title='{html.escape(n)}: {html.escape(v or 'com o app aberto')}'>"
+        f"<span class='ponto'></span>{html.escape(n.split()[0])}</span>"
+        for n, v in pessoas if n != eu)
+    nao_lidas = sum(get_equipe().nao_lidas(eu).values())
+    aviso = (f"<span class='chip atencao'>{nao_lidas} mensage{'ns' if nao_lidas > 1 else 'm'} "
+             f"nova{'s' if nao_lidas > 1 else ''}</span>") if nao_lidas else ""
+    sair = " · <a href='/logout'>sair</a>" if CONTAS else ""
+    return (f"<div class='topo'><div><div class='marca'>EixoAI</div>"
+            f"<div class='suave'>Documentos da equipe, versões e perguntas</div></div>"
+            f"<div class='topo-dir'>{aviso}{chips}<span class='eu'>{html.escape(eu)}{sair}</span></div></div>")
+
+# ─── Perguntar ────────────────────────────────────────────────────────────────
+
+def _buscar(pergunta: str, llm: Optional[LLMChain], doc_filtro: Optional[str]) -> List[Dict]:
     """
-    Chamado imediatamente ao clicar em 'Processar PDF'.
-    Retorna o estado de carregamento e bloqueia o chat.
+    Busca híbrida (significado + palavras exatas, com correção de erro de
+    digitação) em busca.py. A IA, se houver, só acrescenta variantes da
+    pergunta; sem ela, ou se ela demorar, a busca segue igual.
+    Antes, a pergunta era reescrita com "termos da Constituição Federal" e
+    isso piorava a busca (Hit@5 de 71,7% para 51,7% nas paráfrases).
     """
-    if file is None:
-        return (
-            _status_error("Selecione um arquivo PDF antes de processar."),
-            gr.update(interactive=False),
-            gr.update(interactive=False),
-            gr.update(interactive=True),   # clear_btn permanece ativo
-        )
-    return (
-        _status_loading(),
-        gr.update(interactive=False),  # bloqueia input de texto
-        gr.update(interactive=False),  # bloqueia botão enviar
-        gr.update(interactive=False),  # bloqueia limpar conversa
-    )
+    reescrever = getattr(llm, "reescrever_pergunta", None) if llm else None
+    return buscar(get_retriever(), pergunta, document_id=doc_filtro, k=5, reescrever=reescrever)
 
 
-def process_pdf(file, llm):
-    """
-    Processa o PDF e o registra na base como versão nova do documento com o
-    mesmo nome de arquivo. Antes, o upload chamava retriever.clear_all() e
-    apagava a base inteira; agora os documentos anteriores continuam lá.
-    """
-    has_docs = get_store().has_documents()
-    if file is None:
-        return (_status_error("Nenhum arquivo selecionado."), gr.update(interactive=has_docs),
-                gr.update(interactive=has_docs), gr.update(interactive=True), gr.update(), llm)
-    try:
-        res, impact, _, n_chars = _register(file, "", "", "enviado pelo chat", "", llm)
-        doc = res.document
-        if res.status == "unchanged":
-            extra = _note(f"Já era a versão vigente de {html.escape(doc.name)} "
-                          f"(v{res.version.version}).")
-        elif res.previous is not None:
-            extra = _alert(res.diff, impact, doc.name, res.previous.version, res.version.version)
-        else:
-            n_docs, _ = get_store().current_totals()
-            extra = _note(f"📚 {html.escape(doc.name)} — versão {res.version.version} · "
-                          f"{n_docs} documento(s) na base")
-        logger.info(f"PDF processado: {res.version.filename} ({res.version.n_chunks} chunks)")
-        return (
-            _status_ready(res.version.filename, res.version.n_chunks, n_chars, extra),
-            gr.update(interactive=True),   # libera input
-            gr.update(interactive=True),   # libera botão enviar
-            gr.update(interactive=True),   # libera limpar conversa
-            gr.update(choices=_scope_choices(), value=doc.id),
-            llm,
-        )
-    except Exception as e:
-        logger.error(f"Erro ao processar PDF: {str(e)}")
-        return (_status_error(f"Erro: {str(e)}"), gr.update(interactive=has_docs),
-                gr.update(interactive=has_docs), gr.update(interactive=True), gr.update(), llm)
+def _fontes_html(resultados: List[Dict]) -> str:
+    if not resultados:
+        return ("<div class='suave'>Nenhum trecho dos documentos parece responder a essa "
+                "pergunta. Tente com outras palavras ou escolha um documento em "
+                "<b>Procurar em</b>.</div>")
+    nomes = {d.id: d.name for d in get_store().list_documents()}
+    itens = []
+    for r in resultados:
+        rel = r.get("relevance", 0) or 0
+        nivel = "alta" if rel >= 0.6 else ("média" if rel >= 0.35 else "baixa")
+        texto = " ".join(str(r.get("text", "")).split())
+        if len(texto) > 420:
+            texto = texto[:417] + "..."
+        doc = nomes.get(r.get("document_id"), r.get("source", ""))
+        pag = r.get("page")
+        onde = f" · página {pag}" if pag not in (None, "", 0, "0") else ""
+        itens.append(f"<div class='fonte'><div class='fonte-topo'><b>{html.escape(str(doc))}</b>"
+                     f"<span class='suave'>{onde} · relação {nivel}</span></div>"
+                     f"<div class='fonte-texto'>{html.escape(texto)}</div></div>")
+    return "".join(itens)
 
 
-def _expand_query(query: str, llm: "LLMChain") -> str:
-    """
-    Usa a LLM para reescrever a query adicionando termos jurídicos relacionados.
-    Combina a query original com a versão expandida para maximizar o recall.
-    Retorna a query original em caso de erro (nunca bloqueia o fluxo).
-    """
-    try:
-        prompt = (
-            "Reescreva a pergunta abaixo adicionando sinônimos e termos jurídicos "
-            "da Constituição Federal brasileira que possam aparecer nos trechos relevantes. "
-            "Responda APENAS com a pergunta reescrita, sem explicações.\n\n"
-            f"Pergunta: {query}"
-        )
-        expanded = llm.generate_response(prompt)
-        # Remove a pergunta do histórico — é uma chamada interna
-        if llm.conversation_history:
-            llm.conversation_history.pop()  # assistant
-            llm.conversation_history.pop()  # user
-        combined = f"{query} {expanded}"
-        logger.info(f"🔎 Query expandida: {combined[:120]}…")
-        return combined
-    except Exception as e:
-        logger.warning(f"Query expansion falhou, usando original: {e}")
-        return query
+SYSTEM_PROMPT = (
+    "Você responde perguntas sobre os documentos de uma equipe (regulamentos, contratos, "
+    "manuais, editais) para pessoas que não são da área jurídica. "
+    "Use só o contexto fornecido. Escreva em português do Brasil, em frases curtas e "
+    "palavras simples, sem emoji. Diga de qual documento e de qual artigo veio a "
+    "informação (ex.: 'Pelo Regulamento Interno, art. 12, ...'). "
+    "Se o contexto não tiver a resposta, diga isso claramente e sugira o que a pessoa "
+    "pode perguntar ou em qual documento procurar."
+)
+MAX_CONTEXT_CHARS = 12_000
 
 
-def send_message(user_message: str, history: List[Dict], llm: Optional[LLMChain], scope: str):
-    if not user_message.strip():
-        return "", history, "", llm
-
-    chunk_info = ""
-    doc_filter = None if (not scope or scope == ALL_DOCS) else scope
-
-    # Um LLMChain por sessão: o histórico não vaza entre usuários. Sem chave do
-    # Groq, a busca roda mesmo assim e os trechos aparecem no rastreamento.
-    llm_error = None
-    if llm is None:
+def perguntar(pergunta: str, historico: List[Dict], llm: Optional[LLMChain], modelo: str,
+              escopo: str):
+    pergunta = (pergunta or "").strip()
+    if not pergunta:
+        return "", historico, gr.skip(), llm
+    llm = _chain(llm, modelo)
+    doc_filtro = None if (not escopo or escopo == ALL_DOCS) else escopo
+    fontes = ""
+    contexto = ""
+    if not get_store().has_documents():
+        resposta = ("A base ainda está vazia. Envie um documento na aba Documentos e "
+                    "depois pergunte aqui.")
+        fontes = "<div class='suave'>Sem documentos na base.</div>"
+    else:
         try:
-            llm = LLMChain(stream=False)
+            resultados = _buscar(pergunta, llm, doc_filtro)
+            fontes = _fontes_html(resultados)
+            contexto = get_retriever().format_context(resultados) if resultados else ""
         except Exception as e:
-            llm_error = e
-
-    try:
-        context = ""
-        if get_store().has_documents():
-            retriever = get_retriever()
-            try:
-                # Expande a query com termos jurídicos antes de buscar
-                search_query = _expand_query(user_message, llm) if llm else user_message
-                # Só a versão vigente de cada documento (padrão do search)
-                results = retriever.search(search_query, top_k=5, rerank=True,
-                                           document_id=doc_filter)
-                if results:
-                    chunk_parts = ["🔍 **CHUNKS RECUPERADOS — RASTREAMENTO COMPLETO**\n"]
-                    chunk_parts.append("=" * 100)
-                    for i, result in enumerate(results, 1):
-                        chunk_parts.append(f"\n### **[{i}] CHUNK #{result['chunk']}**")
-                        chunk_parts.append(f"📄 **Arquivo:** {md_escape(str(result['source']))}")
-                        chunk_parts.append(f"🗂️ **Documento:** `{result.get('document_id')}` "
-                                           f"(trecho vigente desde a v{result.get('version', '—')})")
-                        chunk_parts.append(f"📍 **Página:** {result['page']}")
-                        chunk_parts.append(f"🎯 **Relevância:** {result['relevance']:.1%}")
-                        chunk_parts.append(f"🆔 **ID:** `{result['id']}`")
-                        chunk_parts.append(f"📊 **Distância:** {result['distance']:.4f}")
-                        chunk_parts.append(f"\n**CONTEÚDO COMPLETO:**")
-                        chunk_parts.append(_fence(result["text"]))
-                        chunk_parts.append("-" * 100)
-                    chunk_info = "\n".join(chunk_parts)
-                    # Antes: get_context() fazia a mesma busca de novo (2º embedding + 2ª query).
-                    context = retriever.format_context(results)
-                else:
-                    chunk_info = "⚠️ Nenhum chunk relevante encontrado para esta pergunta."
-            except Exception as e:
-                logger.warning(f"Erro ao recuperar contexto: {str(e)}")
-                chunk_info = f"❌ Erro ao recuperar chunks: {str(e)}"
-        else:
-            chunk_info = "📭 Nenhum PDF carregado."
-
-        system_prompt = (
-            "Você é um assistente útil que responde perguntas sobre documentos. "
-            "Use o contexto fornecido para responder com precisão. "
-            "Se a informação não estiver no contexto, diga claramente."
-        )
-
-        # Limite de segurança: nunca enviar mais do que ~12 000 caracteres de contexto
-        # (~3 000 tokens), deixando espaço para o histórico e a resposta.
-        MAX_CONTEXT_CHARS = 12_000
-        safe_context = context[:MAX_CONTEXT_CHARS] if context else ""
-
+            logger.warning(f"Erro na busca: {e}")
+            fontes = _aviso_erro(f"a busca falhou ({e}).")
         if llm is None:
-            response = (f"⚠️ A LLM não está disponível ({llm_error}). Configure a GROQ_API_KEY "
-                        f"no .env. Os trechos encontrados estão no rastreamento abaixo.")
+            resposta = ("A IA não está disponível agora (falta a chave do Groq no arquivo .env). "
+                        "Os trechos que respondem à pergunta estão ao lado.")
         else:
-            response = llm.generate_response(
-                user_message=user_message,
-                system_prompt=system_prompt,
-                context=safe_context,
-            )
+            try:
+                resposta, aviso = _com_reserva(llm, lambda c: c.generate_response(
+                    user_message=pergunta, system_prompt=SYSTEM_PROMPT,
+                    context=contexto[:MAX_CONTEXT_CHARS]))
+                if aviso:
+                    resposta += f"\n\n_{aviso}_"
+            except IAOcupada:
+                resposta = ("Os modelos de IA estão no limite de uso por minuto da conta gratuita "
+                            "do Groq. Espere alguns segundos e pergunte de novo. Enquanto isso, os "
+                            "trechos que respondem à pergunta estão ao lado.")
+            except Exception as e:
+                logger.error(f"Erro na IA: {e}")
+                resposta = ("A IA não conseguiu responder agora. Os trechos encontrados estão ao "
+                            "lado; tente de novo em instantes ou escolha outro modelo no topo.")
+    historico = historico + [{"role": "user", "content": pergunta},
+                             {"role": "assistant", "content": resposta}]
+    return "", historico, fontes, llm
 
-    except Exception as e:
-        response = f"❌ Erro ao processar mensagem:\n{str(e)}"
-        # Se a busca deu certo e só a LLM falhou, os chunks continuam visíveis.
-        if not chunk_info.startswith("🔍"):
-            chunk_info = f"❌ Erro: {str(e)}"
-        logger.error(f"Erro ao chamar LLM: {str(e)}")
 
-    history.append({"role": "user", "content": user_message})
-    history.append({"role": "assistant", "content": response})
-    return "", history, chunk_info, llm
-
-
-def clear_chat(llm):
-    """
-    Limpa só a conversa desta sessão. Antes, 'Limpar tudo' apagava o documento
-    do banco; com histórico de versões, apagar documento deixou de ser papel do chat.
-    """
+def nova_conversa(llm):
     if llm is not None:
         llm.clear_history()
-    return [], "Nenhum chunk recuperado ainda.", llm
+    return [], "<div class='suave'>As fontes de cada resposta aparecem aqui.</div>", llm
+
+# ─── Documentos: navegação, envio e comparação ────────────────────────────────
+
+def _painel_doc(doc_id: Optional[str], secao: str, eu: str) -> Dict:
+    """Atualizações do painel do documento: cabeçalho e a seção visível."""
+    out = {doc_cab: _cabecalho_doc(doc_id)}
+    if secao == "Texto atual":
+        out[doc_texto] = _texto_atual_md(doc_id)
+    elif secao == "Histórico":
+        out[doc_hist] = _historico(doc_id)
+        vs = _versoes_escolha(doc_id)
+        out[cmp_a] = gr.update(choices=vs, value=vs[-2][1] if len(vs) > 1 else (vs[0][1] if vs else None))
+        out[cmp_b] = gr.update(choices=vs, value=vs[-1][1] if vs else None)
+    elif secao == "Conversa":
+        if doc_id:
+            get_equipe().marcar_lida(eu, doc_id)
+        out[doc_conversa] = _conversa_html(doc_id, eu, "Ninguém escreveu sobre este documento ainda.") \
+            if doc_id else ""
+    elif secao == "Mudanças":
+        pass                           # preenchida por envio ou comparação
+    return out
 
 
-def on_load():
-    """Ao abrir a página: habilita o chat se a base já tem documentos."""
-    n_docs, n_chunks = get_store().current_totals()
-    has = n_docs > 0
-    status = _status_base(n_docs, n_chunks) if has else _status_idle()
-    return (status, gr.update(interactive=has), gr.update(interactive=has),
-            gr.update(choices=_scope_choices(), value=ALL_DOCS))
+def _visibilidade(secao: str) -> Dict:
+    return {sec_texto: gr.update(visible=secao == "Texto atual"),
+            sec_mud: gr.update(visible=secao == "Mudanças"),
+            sec_hist: gr.update(visible=secao == "Histórico"),
+            sec_conv: gr.update(visible=secao == "Conversa")}
 
 
-# No Gradio 6.3, componente de aba oculta que recebe atualização fica preso com
-# o "carregando" por cima quando a aba aparece. Por isso cada aba se atualiza
-# ao ser aberta, em vez de receber atualização da outra aba.
+# A seção é trocada em dois passos: primeiro aparece (mostrar_secao), depois
+# recebe o conteúdo (preencher). Conteúdo mandado para uma coluna escondida no
+# mesmo passo em que ela aparece se perdia no Gradio 6.3 (o histórico vinha vazio).
+# O que já foi calculado num envio ou numa comparação vai pelo `pendente`.
 
-def on_chat_tab(scope_value):
-    choices = _scope_choices()
-    has = len(choices) > 1
-    keep = scope_value if scope_value in [v for _, v in choices] else ALL_DOCS
-    return (gr.update(choices=choices, value=keep),
-            gr.update(interactive=has), gr.update(interactive=has))
+def mostrar_secao(secao):
+    return _visibilidade(secao)
 
 
-def on_versions_tab(h_doc_value):
-    docs = _doc_choices()
-    ids = [d for _, d in docs]
-    sel = h_doc_value if h_doc_value in ids else (ids[0] if ids else None)
-    return (gr.update(choices=docs), gr.update(choices=docs, value=sel), *show_history(sel))
+def _ultima_mudanca(doc_id: Optional[str], llm: Optional[LLMChain]) -> Dict:
+    """Seção Mudanças sem comparação escolhida: mostra a última mudança do documento."""
+    if not doc_id:
+        return {mud_alerta: "", mud_resumo: "", mud_impacto: "", mud_detalhe: ""}
+    vs = get_store().list_versions(doc_id)
+    if len(vs) < 2:
+        return {mud_alerta: _caixa("Este documento só tem uma versão. Quando alguém enviar "
+                                   "uma versão nova, as mudanças aparecem aqui."),
+                mud_resumo: "", mud_impacto: "", mud_detalhe: ""}
+    alerta, resumo, impacto, detalhe = _comparar(doc_id, vs[-2].version, vs[-1].version, llm)
+    return {mud_alerta: alerta, mud_resumo: resumo, mud_impacto: impacto, mud_detalhe: detalhe}
 
-# ─── CSS customizado ───────────────────────────────────────────────────────────
 
-CUSTOM_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
+def preencher(secao, doc_id, pendente, modelo, llm, request: gr.Request):
+    eu = quem(request)
+    out = _painel_doc(doc_id, secao, eu)
+    if secao == "Mudanças":
+        if pendente and pendente.get("doc") == doc_id:
+            out.update({mud_alerta: pendente["alerta"], mud_resumo: pendente["resumo"],
+                        mud_impacto: pendente["impacto"], mud_detalhe: pendente["detalhe"]})
+        else:
+            llm = _chain(llm, modelo)
+            out.update(_ultima_mudanca(doc_id, llm))
+    out[pendente_state] = None
+    out[llm_state] = llm
+    return out
 
-/* Chat bloqueado — feedback visual claro */
-.chat-blocked textarea {
-    opacity: 0.45 !important;
-    cursor: not-allowed !important;
-}
-.chat-blocked button {
-    opacity: 0.45 !important;
-    cursor: not-allowed !important;
-}
 
-/* Remove borda padrão do Gradio no status */
-#pdf-status, #version-alert {
-    border: none !important;
-    background: transparent !important;
-    padding: 0 !important;
-}
+def comparar(doc_id, va, vb, modelo, llm):
+    llm = _chain(llm, modelo)
+    if not doc_id or va is None or vb is None:
+        return {pendente_state: None, llm_state: llm}
+    alerta, resumo, impacto, detalhe = _comparar(doc_id, va, vb, llm)
+    out = {pendente_state: {"doc": doc_id, "alerta": alerta, "resumo": resumo, "impacto": impacto,
+                            "detalhe": detalhe},
+           llm_state: llm, secao: "Mudanças"}
+    out.update(_visibilidade("Mudanças"))
+    return out
 
-/* Área de chunk com fonte mono */
-#chunk-tracker .prose {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12px;
-}
 
-/* Botão primário */
-.primary-btn {
-    font-family: 'JetBrains Mono', monospace !important;
-    font-weight: 600 !important;
-    letter-spacing: 0.03em !important;
-}
+def enviar_arquivo(arquivo, destino, nome_novo, motivo, apelidos, modelo, llm, mine,
+                   request: gr.Request):
+    eu = quem(request)
+    if arquivo is None:
+        return {envio_status: _aviso_erro("escolha um arquivo PDF.")}
+    llm = _chain(llm, modelo)
+    try:
+        res, impacto, resumo = _registrar(arquivo, destino, nome_novo, eu, motivo, apelidos, llm)
+    except Exception as e:
+        logger.error(f"Erro ao registrar versão: {e}")
+        return {envio_status: _aviso_erro(str(e)), llm_state: llm}
 
-/* Paleta vermelho / preto / branco */
-.gradio-container { background: #0a0a0a !important; }
-.prose h1, .prose h2, .prose h3, .prose h4 { color: #fafafa !important; }
-.prose h1 { border-bottom: 3px solid #dc2626; padding-bottom: 6px; display: inline-block; }
-.prose strong { color: #fafafa; }
-.prose code { background: #1c1c1c !important; color: #f87171 !important; }
-.prose blockquote { border-left: 3px solid #dc2626 !important; color: #d4d4d4; }
-button[role="tab"][aria-selected="true"] { color: #fafafa !important; border-bottom: 2px solid #dc2626 !important; }
-button[role="tab"] { color: #a3a3a3 !important; }
+    doc = res.document
+    out = {envio_status: "", envio_arquivo: None, envio_motivo: "", envio_nome: "",
+           envio_destino: gr.update(choices=_destinos_envio(), value=NOVO_DOC),
+           envio_nome_box: gr.update(visible=True),
+           doc_lista: gr.update(choices=_lista_docs(), value=doc.id),
+           llm_state: llm, mine_state: mine + [f"{doc.id}:{res.version.version}"]}
+    if res.status == "unchanged":
+        out[envio_status] = _caixa(
+            f"Esse arquivo é igual à versão atual de {html.escape(doc.name)} "
+            f"(versão {res.version.version}). Nada foi criado.")
+        return out
+    v_antes = res.previous.version if res.previous else None
+    nova_secao = "Mudanças" if v_antes else "Texto atual"
+    out[secao] = nova_secao
+    out.update(_visibilidade(nova_secao))
+    if v_antes:
+        out[pendente_state] = {
+            "doc": doc.id,
+            "alerta": _alerta_mudanca(res.diff, impacto, doc.name, v_antes, res.version.version),
+            "resumo": resumo or "", "impacto": format_report(impacto) if impacto else "",
+            "detalhe": _mudancas_md(res.diff) if res.diff else ""}
+    else:
+        out[envio_status] = _aviso_ok(f"{doc.name} foi adicionado à base.")
+    return out
+
+
+def mudar_destino(destino):
+    return gr.update(visible=destino == NOVO_DOC)
+
+# ─── Equipe ───────────────────────────────────────────────────────────────────
+
+def escrever_geral(texto, request: gr.Request):
+    eu = quem(request)
+    get_equipe().enviar(SALA_GERAL, eu, texto)
+    get_equipe().marcar_lida(eu, SALA_GERAL)
+    return "", _conversa_html(SALA_GERAL, eu, "Ninguém escreveu ainda. Comece a conversa."), \
+        _atividade_html()
+
+
+def escrever_doc(texto, doc_id, request: gr.Request):
+    eu = quem(request)
+    if not doc_id:
+        return texto, _aviso_erro("escolha um documento na lista.")
+    get_equipe().enviar(doc_id, eu, texto)
+    get_equipe().marcar_lida(eu, doc_id)
+    return "", _conversa_html(doc_id, eu, "Ninguém escreveu sobre este documento ainda.")
+
+# ─── Abas e tempo real ────────────────────────────────────────────────────────
+
+def _vendo(aba: str, doc_id: Optional[str], sec: str) -> str:
+    if aba == "documentos":
+        nome = _nome_doc(doc_id)
+        return f"Documentos: {nome} ({sec.lower()})" if nome else "Documentos"
+    return {"perguntar": "Perguntando à IA", "equipe": "Na conversa da equipe"}.get(aba, "")
+
+
+def ao_abrir(request: gr.Request):
+    eu = quem(request)
+    get_equipe().sinal(eu, "Perguntando à IA")
+    docs = _lista_docs()
+    return {
+        topo: _topo_html(eu),
+        modelo: gr.update(choices=modelos_disponiveis(), value=DEFAULT_MODEL),
+        escopo: gr.update(choices=_escopos(), value=ALL_DOCS),
+        doc_lista: gr.update(choices=docs, value=docs[0][1] if docs else None),
+        envio_destino: gr.update(choices=_destinos_envio(), value=NOVO_DOC),
+        visto_versao: get_store().last_change(),
+        visto_msg: get_equipe().ultima_mensagem(),
+    }
+
+
+def abrir_perguntar(escopo_atual, request: gr.Request):
+    get_equipe().sinal(quem(request), "Perguntando à IA")
+    ids = [v for _, v in _escopos()]
+    return "perguntar", gr.update(choices=_escopos(),
+                                  value=escopo_atual if escopo_atual in ids else ALL_DOCS)
+
+
+def abrir_documentos(doc_id, sec, request: gr.Request):
+    eu = quem(request)
+    docs = _lista_docs()
+    ids = [v for _, v in docs]
+    sel = doc_id if doc_id in ids else (ids[0] if ids else None)
+    get_equipe().sinal(eu, _vendo("documentos", sel, sec))
+    out = {aba: "documentos", doc_lista: gr.update(choices=docs, value=sel),
+           envio_destino: gr.update(choices=_destinos_envio())}
+    out.update(_painel_doc(sel, sec, eu))
+    return out
+
+
+def abrir_equipe(request: gr.Request):
+    eu = quem(request)
+    get_equipe().sinal(eu, "Na conversa da equipe")
+    get_equipe().marcar_lida(eu, SALA_GERAL)
+    return ("equipe", _conversa_html(SALA_GERAL, eu, "Ninguém escreveu ainda. Comece a conversa."),
+            _online_html(eu), _atividade_html(), _topo_html(eu))
+
+
+def a_cada_instante(v_visto, m_visto, mine, aba_atual, doc_id, sec, escopo_atual, topo_antes,
+                    online_antes, request: gr.Request):
+    """
+    Roda a cada REFRESH_SECONDS em cada tela aberta: dá sinal de presença,
+    avisa o que os outros fizeram e atualiza só a aba aberta.
+    """
+    eu = quem(request)
+    eq, store = get_equipe(), get_store()
+    eq.sinal(eu, _vendo(aba_atual, doc_id, sec))
+
+    v_ultimo, m_ultimo = store.last_change(), eq.ultima_mensagem()
+    mudou_v, mudou_m = v_ultimo != v_visto, m_ultimo != m_visto
+    # Sempre ao menos uma chave: dicionário vazio o Gradio lê como "um valor só".
+    out: Dict = {visto_versao: v_ultimo}
+
+    if mudou_v:
+        for _, nome, v in store.versions_since(v_visto or 0):
+            if f"{v.document_id}:{v.version}" in mine:
+                continue
+            acao = f"enviou {nome}" if v.version == 1 else f"publicou a versão {v.version} de {nome}"
+            gr.Info(f"{v.author or 'Alguém'} {acao}.", duration=20)
+        out[visto_versao] = v_ultimo
+    if mudou_m:
+        for m_id in range((m_visto or 0) + 1, m_ultimo + 1):
+            m = eq.mensagem(m_id)
+            if m is None or m.autor == eu:
+                continue
+            vendo_sala = (aba_atual == "equipe" and m.sala == SALA_GERAL) or \
+                         (aba_atual == "documentos" and sec == "Conversa" and m.sala == doc_id)
+            if not vendo_sala:
+                onde = "" if m.sala == SALA_GERAL else f" sobre {_nome_doc(m.sala)}"
+                texto = m.texto if len(m.texto) <= 90 else m.texto[:87] + "..."
+                gr.Info(f"{m.autor}{onde}: {texto}", duration=10)
+        out[visto_msg] = m_ultimo
+
+    novo_topo = _topo_html(eu)
+    if novo_topo != topo_antes:
+        out[topo] = novo_topo
+        out[topo_cache] = novo_topo
+
+    if aba_atual == "perguntar" and mudou_v:
+        ids = [v for _, v in _escopos()]
+        out[escopo] = gr.update(choices=_escopos(),
+                                value=escopo_atual if escopo_atual in ids else ALL_DOCS)
+    elif aba_atual == "documentos":
+        if mudou_v:
+            out[doc_lista] = gr.update(choices=_lista_docs())
+            out[envio_destino] = gr.update(choices=_destinos_envio())
+            out[doc_cab] = _cabecalho_doc(doc_id)
+            if sec == "Texto atual":
+                out[doc_texto] = _texto_atual_md(doc_id)
+            elif sec == "Histórico":
+                out.update(_painel_doc(doc_id, sec, eu))
+        if mudou_m and sec == "Conversa" and doc_id:
+            eq.marcar_lida(eu, doc_id)
+            out[doc_conversa] = _conversa_html(doc_id, eu, "Ninguém escreveu sobre este documento ainda.")
+    elif aba_atual == "equipe":
+        if mudou_m:
+            eq.marcar_lida(eu, SALA_GERAL)
+            out[geral_conversa] = _conversa_html(SALA_GERAL, eu, "Ninguém escreveu ainda. Comece a conversa.")
+        if mudou_v or mudou_m:
+            out[atividade] = _atividade_html()
+        novo_online = _online_html(eu)
+        if novo_online != online_antes:
+            out[quem_aqui] = novo_online
+            out[online_cache] = novo_online
+    return out
+
+# ─── CSS ──────────────────────────────────────────────────────────────────────
+
+CUSTOM_CSS = f"""
+@import url('https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600&f[]=clash-display@500,600&display=swap');
+
+:root {{ --fundo:{FUNDO}; --painel:{PAINEL}; --linha:{LINHA}; --texto:{TEXTO};
+         --suave:{SUAVE}; --destaque:{DESTAQUE}; --atencao:{ATENCAO}; }}
+.gradio-container {{ background: var(--fundo) !important; max-width: 1280px !important;
+                     width: 100% !important;
+                     margin: 0 auto !important; padding: 12px 20px !important; }}
+footer {{ display: none !important; }}
+.suave {{ color: var(--suave); font-size: 13px; }}
+
+/* Topo */
+.topo {{ display:flex; justify-content:space-between; align-items:center; gap:16px;
+        padding: 6px 2px 10px; border-bottom: 1px solid var(--linha); }}
+.marca {{ font-family: 'Clash Display', 'General Sans', sans-serif; font-weight: 600;
+          font-size: 26px; letter-spacing: .01em; line-height: 1.1; }}
+.marca::after {{ content: ''; display:inline-block; width:8px; height:8px; border-radius:50%;
+                 background: var(--destaque); margin-left: 6px; }}
+.topo-dir {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end; }}
+.eu {{ font-size: 13px; color: var(--suave); }}
+.eu a {{ color: var(--suave) !important; }}
+.chip {{ display:inline-flex; align-items:center; gap:6px; padding: 3px 10px; border-radius: 999px;
+         border: 1px solid var(--linha); font-size: 12px; }}
+.chip.atencao {{ border-color: var(--atencao); color: var(--atencao); }}
+.ponto {{ width:7px; height:7px; border-radius:50%; background: var(--destaque); display:inline-block;
+          box-shadow: 0 0 0 3px rgba(61,219,195,.15); flex-shrink:0; }}
+#linha-topo {{ align-items: center; gap: 16px; border-bottom: 1px solid var(--linha);
+                padding-bottom: 8px; margin-bottom: 4px; }}
+#linha-topo .topo {{ border-bottom: 0; padding-bottom: 0; }}
+#caixa-modelo {{ gap: 2px !important; }}
+.rotulo {{ font-size: 12px; color: var(--suave); }}
+button.secondary {{ border: 1px solid {LINHA_FORTE} !important; }}
+.progress-text, .meta-text, .meta-text-center {{ display: none !important; }}
+
+/* Abas */
+button[role="tab"] {{ font-size: 15px !important; color: var(--suave) !important; }}
+button[role="tab"][aria-selected="true"] {{ color: var(--texto) !important;
+    border-bottom: 2px solid var(--destaque) !important; }}
+
+/* Caixas de aviso */
+.caixa {{ border: 1px solid; border-radius: 10px; padding: 12px 16px; line-height: 1.5;
+          display:flex; flex-direction:column; gap:4px; font-size: 14px; }}
+.alerta-titulo {{ font-size: 15px; }}
+
+/* Perguntar */
+#chat-ia {{ height: calc(100vh - 300px) !important; min-height: 320px; }}
+#fontes {{ height: calc(100vh - 250px); min-height: 360px; overflow-y: auto; padding-right: 4px; }}
+.fonte {{ border-top: 1px solid var(--linha); padding: 10px 0; }}
+.fonte:first-child {{ border-top: 0; padding-top: 0; }}
+.fonte-topo {{ display:flex; gap:6px; flex-wrap:wrap; align-items:baseline; margin-bottom:4px; }}
+.fonte-texto {{ font-size: 13px; color: #CFDCDF; line-height: 1.5; }}
+
+/* Documentos */
+#doc-lista {{ max-height: calc(100vh - 470px); min-height: 140px; overflow-y: auto; }}
+#doc-lista .wrap {{ flex-direction: column !important; gap: 4px !important; }}
+#doc-lista label {{ width: 100% !important; justify-content: flex-start; }}
+.doc-cab {{ padding: 2px 0 6px; }}
+.doc-cab.vazio {{ color: var(--suave); padding: 24px 0; }}
+.doc-nome {{ font-family: 'Clash Display', 'General Sans', sans-serif; font-size: 22px; font-weight: 500; }}
+#doc-texto, #mud-rolagem {{ max-height: calc(100vh - 330px); overflow-y: auto; padding-right: 6px; }}
+#doc-texto p {{ margin: 0 0 10px; line-height: 1.6; }}
+#secao .wrap {{ gap: 4px !important; }}
+
+/* Conversas */
+.conversa {{ display:flex; flex-direction: column-reverse; gap: 10px; overflow-y:auto;
+             height: calc(100vh - 360px); min-height: 220px; padding: 4px 4px 4px 0; }}
+.conversa-vazia {{ color: var(--suave); margin: auto; }}
+.msg {{ max-width: 78%; align-self: flex-start; background: {PAINEL_2}; border: 1px solid var(--linha);
+        border-radius: 10px; padding: 8px 12px; }}
+.msg.minha {{ align-self: flex-end; border-color: rgba(61,219,195,.35); background: rgba(61,219,195,.08); }}
+.msg-topo {{ display:flex; align-items:center; gap:8px; font-size: 13px; margin-bottom: 2px; }}
+.msg-texto {{ white-space: pre-wrap; line-height: 1.5; }}
+.avatar {{ width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--linha-forte, {LINHA_FORTE});
+           display:inline-flex; align-items:center; justify-content:center; font-size: 10px;
+           font-family: 'JetBrains Mono', monospace; flex-shrink:0; }}
+.pessoa {{ display:flex; align-items:center; gap: 10px; padding: 6px 0; }}
+#atividade {{ max-height: calc(100vh - 470px); overflow-y: auto; }}
+.evento {{ padding: 7px 0; border-top: 1px solid var(--linha); font-size: 14px; }}
+.evento:first-child {{ border-top: 0; }}
+.titulo-bloco {{ font-family: 'Clash Display', 'General Sans', sans-serif; font-size: 17px;
+                 font-weight: 500; margin: 2px 0 6px; }}
+
+@media (max-width: 900px) {{
+  #chat-ia, #fontes, .conversa, #doc-texto, #mud-rolagem {{ height: auto !important; max-height: 60vh; }}
+}}
 """
 
-# ─── Interface Gradio ──────────────────────────────────────────────────────────
+# ─── Interface ────────────────────────────────────────────────────────────────
 
 with gr.Blocks(title="EixoAI") as demo:
 
-    llm_state = gr.State(None)     # LLMChain desta sessão (histórico do chat)
+    llm_state = gr.State(None)          # conversa desta pessoa com a IA
+    mine_state = gr.State([])           # versões publicadas por esta sessão
+    visto_versao = gr.State(0)          # última versão que esta tela já mostrou
+    visto_msg = gr.State(0)             # última mensagem que esta tela já mostrou
+    aba = gr.State("perguntar")         # aba aberta, para o tempo real não mexer na oculta
+    topo_cache = gr.State("")
+    online_cache = gr.State("")
+    pendente_state = gr.State(None)     # mudanças já calculadas, esperando a seção aparecer
 
-    gr.Markdown("# 📚 EixoAI — Chat com PDFs")
-    gr.Markdown("Busca semântica com rastreamento de chunks e histórico de versões dos documentos")
+    with gr.Row(elem_id="linha-topo", equal_height=True):
+        topo = gr.HTML(_topo_html("Visitante"), elem_id="topo")
+        with gr.Column(scale=0, min_width=250, elem_id="caixa-modelo"):
+            gr.HTML("<div class='rotulo'>Modelo de IA</div>")
+            modelo = gr.Dropdown(show_label=False, container=False, elem_id="modelo",
+                                 choices=[(DEFAULT_MODEL, DEFAULT_MODEL)], value=DEFAULT_MODEL)
 
     with gr.Tabs():
-        # ══ Aba 1: Chat ══════════════════════════════════════════════════════
-        with gr.Tab("💬 Chat") as chat_tab:
+        # ── Perguntar ────────────────────────────────────────────────────────
+        with gr.Tab("Perguntar") as tab_perguntar:
             with gr.Row():
-
-                # ── Coluna esquerda: upload + status ──────────────────
-                with gr.Column(scale=1):
-                    gr.Markdown("### 📄 Documento")
-
-                    pdf_file = gr.File(
-                        label="Selecione um PDF",
-                        file_types=[".pdf"],
-                    )
-
-                    upload_btn = gr.Button(
-                        "⚙️  Processar PDF",
-                        variant="primary",
-                        elem_classes=["primary-btn"],
-                    )
-
-                    # Painel de status — muda conforme o estado
-                    pdf_status = gr.HTML(
-                        value=_status_idle(),
-                        elem_id="pdf-status",
-                    )
-
-                    scope = gr.Dropdown(
-                        label="Buscar em",
-                        choices=[("Todos os documentos", ALL_DOCS)],
-                        value=ALL_DOCS,
-                        info="Sempre na versão vigente de cada documento",
-                    )
-
-                    gr.Markdown("---")
-                    clear_btn = gr.Button("🧹  Limpar conversa", variant="secondary")
-
-                # ── Coluna direita: chat ───────────────────────────────
-                with gr.Column(scale=2):
-                    gr.Markdown("### 💬 Chat")
-
-                    chatbot = gr.Chatbot(
-                        label="Histórico",
-                        height=420,
-                    )
-
+                with gr.Column(scale=3):
+                    chat = gr.Chatbot(show_label=False, elem_id="chat-ia",
+                                      placeholder="Pergunte qualquer coisa sobre os documentos da "
+                                                  "equipe, do jeito que você falaria.")
                     with gr.Row():
-                        msg_input = gr.Textbox(
-                            label="Mensagem",
-                            placeholder="Pergunte sobre os documentos da base (carregue um PDF se ela estiver vazia)…",
-                            scale=4,
-                            interactive=False,   # bloqueado até haver documento na base
-                            elem_id="msg-input",
-                        )
-                        send_btn = gr.Button(
-                            "Enviar",
-                            scale=1,
-                            interactive=False,
-                            variant="primary",
-                        )
-
-                    gr.Markdown("---")
-                    gr.Markdown("### 🔍 Rastreamento de Chunks")
-                    chunk_tracker = gr.Markdown(
-                        "Nenhum chunk recuperado ainda.",
-                        elem_id="chunk-tracker",
-                    )
-
-        # ══ Aba 2: Versões ═══════════════════════════════════════════════════
-        with gr.Tab("🗂️ Versões") as versions_tab:
-            with gr.Row():
-                with gr.Column(scale=1):
-                    gr.Markdown("### 📤 Enviar nova versão")
-                    v_file = gr.File(label="PDF da nova versão", file_types=[".pdf"])
-                    v_doc = gr.Dropdown(
-                        label="Documento",
-                        info="Escolha um existente ou digite o nome de um novo",
-                        choices=[], value=None, allow_custom_value=True,
-                    )
-                    v_aliases = gr.Textbox(
-                        label="Como outros documentos o citam (opcional)",
-                        placeholder="ex.: Regulamento, RI",
-                        info="Separado por vírgula. O nome do documento já entra.",
-                    )
-                    v_author = gr.Textbox(label="Autor", placeholder="Quem está enviando")
-                    v_reason = gr.Textbox(label="Motivo da mudança", lines=2,
-                                          placeholder="ex.: redução do prazo de reembolso")
-                    v_btn = gr.Button("📤  Registrar versão", variant="primary",
-                                      elem_classes=["primary-btn"])
-
+                        pergunta = gr.Textbox(show_label=False, scale=5, container=False,
+                                              placeholder="Ex.: em quantos dias recebo o reembolso?",
+                                              autofocus=True)
+                        btn_perguntar = gr.Button("Perguntar", variant="primary", scale=1,
+                                                  min_width=120)
                 with gr.Column(scale=2):
-                    v_alert = gr.HTML("", elem_id="version-alert")
-                    gr.Markdown("### 📝 Resumo da mudança")
-                    v_summary = gr.Markdown("_Envie uma versão ou compare duas abaixo._")
-                    gr.Markdown("### 🔗 Impacto em outros documentos")
-                    v_impact = gr.Markdown("")
-                    with gr.Accordion("🔀 Comparação por artigo", open=False):
-                        v_diff = gr.Markdown("")
+                    with gr.Row():
+                        escopo = gr.Dropdown(label="Procurar em", choices=[("Todos os documentos", ALL_DOCS)],
+                                             value=ALL_DOCS, scale=3)
+                        btn_nova = gr.Button("Nova conversa", scale=1, min_width=120, size="sm")
+                    gr.HTML("<div class='titulo-bloco'>De onde veio a resposta</div>")
+                    fontes = gr.HTML("<div class='suave'>As fontes de cada resposta aparecem aqui.</div>",
+                                     elem_id="fontes")
 
-            gr.Markdown("---")
-            gr.Markdown("### 🕓 Histórico")
+        # ── Documentos ───────────────────────────────────────────────────────
+        with gr.Tab("Documentos") as tab_documentos:
             with gr.Row():
-                h_doc = gr.Dropdown(label="Documento", choices=[], value=None, scale=2)
-                h_a = gr.Dropdown(label="Versão A (antes)", choices=[], scale=1)
-                h_b = gr.Dropdown(label="Versão B (depois)", choices=[], scale=1)
-                h_btn = gr.Button("🔀  Comparar", scale=1)
-            h_table = gr.Dataframe(
-                headers=["Versão", "Data", "Autor", "Motivo", "Arquivo", "SHA-256", "Chunks", "Vigente"],
-                value=[], interactive=False, wrap=True,
-            )
+                with gr.Column(scale=1, min_width=260):
+                    doc_lista = gr.Radio(label="Documentos da equipe", choices=[], value=None,
+                                         elem_id="doc-lista")
+                    with gr.Accordion("Enviar arquivo", open=False):
+                        envio_arquivo = gr.File(label="Arquivo PDF", file_types=[".pdf"], height=110)
+                        envio_destino = gr.Dropdown(label="Este arquivo é", value=NOVO_DOC,
+                                                    choices=[("Um documento novo", NOVO_DOC)])
+                        with gr.Column(visible=True) as envio_nome_box:
+                            envio_nome = gr.Textbox(label="Nome do documento",
+                                                    placeholder="Se ficar vazio, usa o nome do arquivo")
+                        envio_motivo = gr.Textbox(label="O que mudou? (opcional)", lines=2,
+                                                  placeholder="Ex.: prazo de reembolso caiu para 15 dias")
+                        with gr.Accordion("Mais opções", open=False):
+                            envio_apelidos = gr.Textbox(
+                                label="Outros nomes usados para citar este documento",
+                                placeholder="Ex.: Regulamento, RI (separados por vírgula)")
+                        btn_enviar = gr.Button("Enviar", variant="primary", elem_id="btn-enviar")
+                        envio_status = gr.HTML("")
 
-    # ── Event handlers ─────────────────────────────────────────────────────────
+                with gr.Column(scale=3):
+                    doc_cab = gr.HTML(_cabecalho_doc(None))
+                    secao = gr.Radio(choices=SECOES, value="Texto atual", show_label=False,
+                                     elem_id="secao", container=False)
+                    with gr.Column(visible=True) as sec_texto:
+                        doc_texto = gr.Markdown("", elem_id="doc-texto")
+                    with gr.Column(visible=False) as sec_mud:
+                        with gr.Column(elem_id="mud-rolagem"):
+                            mud_alerta = gr.HTML("")
+                            gr.HTML("<div class='titulo-bloco'>Resumo</div>")
+                            mud_resumo = gr.Markdown("")
+                            gr.HTML("<div class='titulo-bloco'>Outros documentos afetados</div>")
+                            mud_impacto = gr.Markdown("")
+                            with gr.Accordion("Ver o texto de antes e de depois", open=False):
+                                mud_detalhe = gr.Markdown("")
+                    with gr.Column(visible=False) as sec_hist:
+                        doc_hist = gr.Dataframe(
+                            headers=["Versão", "Quando", "Quem enviou", "O que mudou", "Arquivo",
+                                     "Código de verificação"],
+                            value=[], interactive=False, wrap=True)
+                        with gr.Row():
+                            cmp_a = gr.Dropdown(label="Comparar a versão", choices=[], scale=2)
+                            cmp_b = gr.Dropdown(label="com a versão", choices=[], scale=2)
+                            btn_comparar = gr.Button("Comparar", scale=1, min_width=110,
+                                                     elem_id="btn-comparar")
+                    with gr.Column(visible=False) as sec_conv:
+                        doc_conversa = gr.HTML("")
+                        with gr.Row():
+                            doc_msg = gr.Textbox(show_label=False, container=False, scale=5,
+                                                 placeholder="Escreva para a equipe sobre este documento")
+                            btn_doc_msg = gr.Button("Enviar", variant="primary", scale=1, min_width=110,
+                                                    elem_id="btn-doc-msg")
 
-    # 1. Clicar em "Processar": imediatamente mostra spinner e bloqueia chat
-    upload_btn.click(
-        fn=start_processing,
-        inputs=[pdf_file],
-        outputs=[pdf_status, msg_input, send_btn, clear_btn],
-        queue=False,          # resposta imediata, sem fila
-    ).then(
-        # 2. Em seguida, registra a versão e atualiza o status
-        fn=process_pdf,
-        inputs=[pdf_file, llm_state],
-        outputs=[pdf_status, msg_input, send_btn, clear_btn, scope, llm_state],
+        # ── Equipe ───────────────────────────────────────────────────────────
+        with gr.Tab("Equipe") as tab_equipe:
+            with gr.Row():
+                with gr.Column(scale=3):
+                    gr.HTML("<div class='titulo-bloco'>Conversa geral</div>")
+                    geral_conversa = gr.HTML("")
+                    with gr.Row():
+                        geral_msg = gr.Textbox(show_label=False, container=False, scale=5,
+                                               placeholder="Escreva para todo mundo")
+                        btn_geral = gr.Button("Enviar", variant="primary", scale=1, min_width=110,
+                                              elem_id="btn-geral")
+                with gr.Column(scale=2):
+                    gr.HTML("<div class='titulo-bloco'>Quem está aqui</div>")
+                    quem_aqui = gr.HTML("")
+                    gr.HTML("<div class='titulo-bloco'>Atividade recente</div>")
+                    atividade = gr.HTML("", elem_id="atividade")
+
+    # ── Eventos ──────────────────────────────────────────────────────────────
+
+
+    # Perguntar
+    for gatilho in (btn_perguntar.click, pergunta.submit):
+        gatilho(perguntar, inputs=[pergunta, chat, llm_state, modelo, escopo],
+                outputs=[pergunta, chat, fontes, llm_state], show_progress="minimal")
+    btn_nova.click(nova_conversa, inputs=[llm_state], outputs=[chat, fontes, llm_state],
+                   show_progress="hidden")
+
+    # Documentos
+    painel = [doc_cab, doc_texto, doc_hist, cmp_a, cmp_b, doc_conversa,
+              mud_alerta, mud_resumo, mud_impacto, mud_detalhe]
+    secoes = [sec_texto, sec_mud, sec_hist, sec_conv]
+    preencher_args = dict(fn=preencher,
+                          inputs=[secao, doc_lista, pendente_state, modelo, llm_state],
+                          outputs=painel + [pendente_state, llm_state], show_progress="minimal")
+    demo.load(ao_abrir, inputs=None,
+              outputs=[topo, modelo, escopo, doc_lista, envio_destino, visto_versao, visto_msg],
+              show_progress="hidden").then(**preencher_args)
+    doc_lista.input(**preencher_args)
+    secao.input(mostrar_secao, inputs=[secao], outputs=secoes, show_progress="hidden",
+                queue=False).then(**preencher_args)
+    envio_destino.change(mudar_destino, inputs=[envio_destino], outputs=[envio_nome_box],
+                         show_progress="hidden")
+    btn_enviar.click(
+        enviar_arquivo,
+        inputs=[envio_arquivo, envio_destino, envio_nome, envio_motivo, envio_apelidos, modelo,
+                llm_state, mine_state],
+        outputs=[envio_status, envio_arquivo, envio_motivo, envio_nome, envio_destino, envio_nome_box,
+                 doc_lista, llm_state, mine_state, secao, pendente_state] + secoes,
+        show_progress="minimal", show_progress_on=[envio_status],
+    ).then(**preencher_args)
+    btn_comparar.click(comparar, inputs=[doc_lista, cmp_a, cmp_b, modelo, llm_state],
+                       outputs=[pendente_state, llm_state, secao] + secoes,
+                       show_progress="minimal", show_progress_on=[btn_comparar]
+                       ).then(**preencher_args)
+    for gatilho in (btn_doc_msg.click, doc_msg.submit):
+        gatilho(escrever_doc, inputs=[doc_msg, doc_lista], outputs=[doc_msg, doc_conversa],
+                show_progress="hidden")
+
+    # Equipe
+    for gatilho in (btn_geral.click, geral_msg.submit):
+        gatilho(escrever_geral, inputs=[geral_msg], outputs=[geral_msg, geral_conversa, atividade],
+                show_progress="hidden")
+
+    # Abas: cada uma se atualiza ao ser aberta
+    tab_perguntar.select(abrir_perguntar, inputs=[escopo], outputs=[aba, escopo],
+                         show_progress="hidden")
+    tab_documentos.select(abrir_documentos, inputs=[doc_lista, secao],
+                          outputs=[aba, doc_lista, envio_destino] + painel, show_progress="hidden")
+    tab_equipe.select(abrir_equipe, outputs=[aba, geral_conversa, quem_aqui, atividade, topo],
+                      show_progress="hidden")
+
+    # Tempo real
+    relogio = gr.Timer(REFRESH_SECONDS)
+    relogio.tick(
+        a_cada_instante,
+        inputs=[visto_versao, visto_msg, mine_state, aba, doc_lista, secao, escopo, topo_cache,
+                online_cache],
+        outputs=[visto_versao, visto_msg, topo, topo_cache, escopo, doc_lista, envio_destino,
+                 doc_cab, doc_texto, doc_hist, cmp_a, cmp_b, doc_conversa, geral_conversa,
+                 atividade, quem_aqui, online_cache],
+        show_progress="hidden",
+        concurrency_limit=None,      # consulta rápida; não espera na fila dos envios
     )
 
-    # Enviar mensagem
-    send_btn.click(
-        fn=send_message,
-        inputs=[msg_input, chatbot, llm_state, scope],
-        outputs=[msg_input, chatbot, chunk_tracker, llm_state],
-    )
 
-    msg_input.submit(
-        fn=send_message,
-        inputs=[msg_input, chatbot, llm_state, scope],
-        outputs=[msg_input, chatbot, chunk_tracker, llm_state],
-    )
-
-    # Limpar conversa (não apaga documentos)
-    clear_btn.click(
-        fn=clear_chat,
-        inputs=[llm_state],
-        outputs=[chatbot, chunk_tracker, llm_state],
-    )
-
-    # Versões
-    v_btn.click(
-        fn=upload_version,
-        inputs=[v_file, v_doc, v_author, v_reason, v_aliases, llm_state],
-        outputs=[v_alert, v_summary, v_diff, v_impact, v_doc, h_doc, llm_state],
-    ).then(fn=show_history, inputs=[h_doc], outputs=[h_table, h_a, h_b])
-
-    chat_tab.select(fn=on_chat_tab, inputs=[scope], outputs=[scope, msg_input, send_btn])
-    versions_tab.select(fn=on_versions_tab, inputs=[h_doc],
-                        outputs=[v_doc, h_doc, h_table, h_a, h_b])
-
-    h_doc.change(fn=show_history, inputs=[h_doc], outputs=[h_table, h_a, h_b])
-    h_btn.click(
-        fn=compare_selected,
-        inputs=[h_doc, h_a, h_b, llm_state],
-        outputs=[v_summary, v_diff, v_impact, llm_state],
-    )
-
-    demo.load(fn=on_load, outputs=[pdf_status, msg_input, send_btn, scope])
+def _enderecos(porta: int) -> List[str]:
+    """Endereços desta máquina na rede (Wi-Fi, VPN), para a equipe entrar."""
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    return [f"http://{ip}:{porta}" for ip in sorted(ips) if not ip.startswith("127.")]
 
 
 if __name__ == "__main__":
+    porta = int(os.environ.get("EIXOAI_PORTA", "7860"))
+    publico = os.environ.get("EIXOAI_LINK_PUBLICO", "1") != "0"
     warm_up()
-    demo.launch(share=True, server_name="0.0.0.0", server_port=7860, theme=THEME, css=CUSTOM_CSS)
+    print("\nEixoAI no ar.")
+    print(f"  Neste computador: http://localhost:{porta}")
+    for e in _enderecos(porta):
+        print(f"  Para a equipe (mesma rede ou VPN): {e}")
+    if CONTAS:
+        print(f"  Login ativo para: {', '.join(c.nome for c in CONTAS)}")
+    else:
+        print("  Sem login: defina EIXOAI_USUARIOS no .env para cada pessoa entrar com o seu nome.")
+    print()
+    demo.launch(
+        share=publico, server_name="0.0.0.0", server_port=porta, theme=THEME, css=CUSTOM_CSS,
+        auth=[(c.login, c.senha) for c in CONTAS] or None,
+        auth_message="Entre com o seu usuário da equipe.",
+        inbrowser=os.environ.get("EIXOAI_ABRIR_NAVEGADOR", "1") != "0",
+    )

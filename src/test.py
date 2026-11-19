@@ -32,6 +32,8 @@ from test_suite.test_llm_chain   import test_llm_chain
 from test_suite.test_integration import test_integration
 from test_suite.test_versioning  import test_versioning
 from test_suite.test_impact      import test_impact
+from test_suite.test_busca       import test_busca
+from test_suite.test_equipe      import test_equipe
 from eval.qa_pairs          import CF88_QA_PAIRS
 from eval.evaluator         import RAGEvaluator
 
@@ -44,7 +46,7 @@ def run_all_tests() -> bool:
     """Executa todas as suítes e retorna True se tudo passou."""
     totals = {"passed": 0, "total": 0}
     for fn in [test_ingester, test_retriever, test_llm_chain, test_integration,
-               test_versioning, test_impact]:
+               test_versioning, test_impact, test_busca, test_equipe]:
         p, t = fn()
         totals["passed"] += p
         totals["total"]  += t
@@ -72,6 +74,8 @@ def interactive_menu() -> None:
         print("  7. Avaliar RAG com PDF da CF/88 (via .env)")
         print("  8. Testar versioning.py")
         print("  9. Testar impact.py")
+        print(" 10. Testar busca.py")
+        print(" 11. Testar equipe.py")
         print("  0. Sair")
         print()
 
@@ -113,6 +117,10 @@ def interactive_menu() -> None:
             test_versioning()
         elif choice == "9":
             test_impact()
+        elif choice == "10":
+            test_busca()
+        elif choice == "11":
+            test_equipe()
         else:
             print(_warn("Opção inválida."))
 
@@ -157,7 +165,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EixoAI — suite de testes e avaliação RAG")
     parser.add_argument("--all",     action="store_true",  help="Rodar todos os testes")
     parser.add_argument("--module",  choices=["ingester", "retriever", "llm_chain", "integration",
-                                             "versioning", "impact"],
+                                             "versioning", "impact", "busca", "equipe"],
                         help="Testar módulo específico")
     parser.add_argument("--eval",    metavar="PDF",        help="Avaliar RAG com PDF")
     parser.add_argument("--sample",  action="store_true",  help="Avaliar com PDF da CF/88 (via .env)")
@@ -178,6 +186,8 @@ if __name__ == "__main__":
             "integration": test_integration,
             "versioning":  test_versioning,
             "impact":      test_impact,
+            "busca":       test_busca,
+            "equipe":      test_equipe,
         }[args.module]
         p, t = fn()
         sys.exit(0 if p == t else 1)

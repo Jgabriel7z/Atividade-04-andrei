@@ -210,3 +210,7 @@ __marimo__/
 vector_db/
 data/uploads/
 data/versions.db
+
+# Gradio guarda cache e envios aqui
+.gradio/
+src/.gradio/

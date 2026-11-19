@@ -400,6 +400,23 @@ class VersionStore:
         with self._conn() as c:
             return c.execute("SELECT 1 FROM documents LIMIT 1").fetchone() is not None
 
+    # tempo real: cada tela pergunta "mudou algo desde a última vez?"
+    def last_change(self) -> int:
+        """Id da versão mais recente da base (0 se vazia). Consulta barata, feita a cada poucos segundos."""
+        with self._conn() as c:
+            row = c.execute("SELECT COALESCE(MAX(id), 0) AS m FROM versions").fetchone()
+        return row["m"]
+
+    def versions_since(self, last_id: int) -> List[Tuple[int, str, VersionInfo]]:
+        """Versões registradas depois de `last_id`: (id, nome do documento, versão), da mais antiga à mais nova."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT v.id AS row_id, d.name AS d_name, v.document_id, v.version, v.filename, "
+                "v.sha256, v.author, v.reason, v.created_at, v.n_chunks, v.is_current, "
+                "v.change_summary FROM versions v JOIN documents d ON d.id = v.document_id "
+                "WHERE v.id > ? ORDER BY v.id", (last_id,)).fetchall()
+        return [(r["row_id"], r["d_name"], self._row_to_version(r, with_text=False)) for r in rows]
+
 
 # ── Publicação: registro + índice ─────────────────────────────
 

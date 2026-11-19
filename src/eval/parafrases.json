@@ -1,0 +1,305 @@
+{
+  "descricao": "Paráfrases para medir a busca: cada pergunta em 3 formas (tecnica, leiga, curta/com erro). Um trecho recuperado conta como acerto se for do documento esperado e contiver o texto de 'contem' (comparação sem acento, sem maiúsculas e com espaços normalizados). Os documentos de data/exemplos/ e o edital do PPGI ficam juntos na mesma base, e a busca é feita em todos (como o 'Buscar em: todos' da interface).",
+  "documentos": {
+    "regulamento-interno": "data/exemplos/regulamento_v1 -> regulamento_v2 (versão vigente: v2)",
+    "contrato-modelo": "data/exemplos/contrato_modelo",
+    "manual-do-colaborador": "data/exemplos/manual",
+    "edital-processo-seletivo-ppgi-2027-1": "Edital_Processo_Seletivo_PPGI_2027_1 (texto extraído do PDF, tabela versions do SQLite de demonstração)"
+  },
+  "perguntas": [
+    {
+      "id": "reg-jornada", "trecho": "Regulamento, art. 3º",
+      "esperado": [{"documento": "regulamento-interno", "contem": "8 (oito) horas diarias"},
+                   {"documento": "manual-do-colaborador", "contem": "expediente vai das 8h"}],
+      "formas": {"tecnica": "Qual é a jornada de trabalho diária e semanal prevista no Regulamento Interno?",
+                 "leiga": "quantas horas eu tenho que trabalhar por dia?",
+                 "curta": "carga horaria semanal"}
+    },
+    {
+      "id": "reg-intervalo", "trecho": "Regulamento, art. 3º",
+      "esperado": [{"documento": "regulamento-interno", "contem": "intervalo minimo de 1 (uma) hora"},
+                   {"documento": "manual-do-colaborador", "contem": "uma hora de almoco"}],
+      "formas": {"tecnica": "Qual o intervalo mínimo para repouso e alimentação durante a jornada?",
+                 "leiga": "quanto tempo eu tenho de almoço?",
+                 "curta": "intervalo almoco"}
+    },
+    {
+      "id": "reg-ponto", "trecho": "Regulamento, art. 4º",
+      "esperado": [{"documento": "regulamento-interno", "contem": "registro de ponto e obrigatorio"}],
+      "formas": {"tecnica": "O registro de ponto é obrigatório e em quais momentos deve ser feito?",
+                 "leiga": "preciso bater o ponto quando chego e quando saio?",
+                 "curta": "bater ponto"}
+    },
+    {
+      "id": "reg-remoto", "trecho": "Regulamento, art. 5º",
+      "esperado": [{"documento": "regulamento-interno", "contem": "trabalho remoto pode ser autorizado"}],
+      "formas": {"tecnica": "Por quantos dias por semana o trabalho remoto pode ser autorizado pela chefia?",
+                 "leiga": "posso trabalhar de casa? quantos dias na semana?",
+                 "curta": "home ofice"}
+    },
+    {
+      "id": "reg-despesas", "trecho": "Regulamento, art. 6º",
+      "esperado": [{"documento": "regulamento-interno", "contem": "serao reembolsadas mediante apresentacao de nota fiscal"},
+                   {"documento": "contrato-modelo", "contem": "despesas comprovadas feitas pelo contratado"},
+                   {"documento": "manual-do-colaborador", "contem": "guarde todas as notas fiscais"}],
+      "formas": {"tecnica": "Quais despesas realizadas a serviço da Cooperativa são reembolsáveis?",
+                 "leiga": "a empresa paga meu hotel e minha comida quando eu viajo a trabalho?",
+                 "curta": "gastos de viagem"}
+    },
+    {
+      "id": "reg-prazo-reembolso", "trecho": "Regulamento, art. 12",
+      "esperado": [{"documento": "regulamento-interno", "contem": "15 (quinze) dias apos a entrega do comprovante"}],
+      "formas": {"tecnica": "Qual o prazo para pagamento do reembolso de despesas após a entrega do comprovante?",
+                 "leiga": "em quantos dias eu recebo de volta o dinheiro que gastei?",
+                 "curta": "reembolso?"}
+    },
+    {
+      "id": "reg-comprovante-90", "trecho": "Regulamento, art. 12, § 1º",
+      "esperado": [{"documento": "regulamento-interno", "contem": "90 (noventa) dias da despesa"}],
+      "formas": {"tecnica": "Comprovantes de despesa entregues após quantos dias deixam de ser reembolsados?",
+                 "leiga": "se eu demorar muito para entregar a nota eu perco o dinheiro?",
+                 "curta": "nota fiscal atrasada"}
+    },
+    {
+      "id": "reg-conta-reembolso", "trecho": "Regulamento, art. 12, § 2º",
+      "esperado": [{"documento": "regulamento-interno", "contem": "depositado na conta salario"},
+                   {"documento": "manual-do-colaborador", "contem": "valor gasto na sua conta salario"}],
+      "formas": {"tecnica": "Em qual conta bancária o reembolso é depositado?",
+                 "leiga": "o dinheiro que eles me devolvem cai em qual conta?",
+                 "curta": "conta do reembolso"}
+    },
+    {
+      "id": "reg-ferias", "trecho": "Regulamento, art. 7º",
+      "esperado": [{"documento": "regulamento-interno", "contem": "antecedencia minima de 30 (trinta) dias"}],
+      "formas": {"tecnica": "Com qual antecedência mínima as férias devem ser solicitadas?",
+                 "leiga": "com quanto tempo antes eu tenho que pedir minhas férias?",
+                 "curta": "ferias antecedencia"}
+    },
+    {
+      "id": "reg-epi", "trecho": "Regulamento, art. 8º",
+      "esperado": [{"documento": "regulamento-interno", "contem": "equipamentos de protecao individual"},
+                   {"documento": "manual-do-colaborador", "contem": "use sempre o uniforme"}],
+      "formas": {"tecnica": "Em quais áreas é obrigatório o uso de uniforme e equipamentos de proteção individual?",
+                 "leiga": "tenho que usar farda e capacete no armazém?",
+                 "curta": "epi obrigatorio"}
+    },
+    {
+      "id": "reg-atestado", "trecho": "Regulamento, art. 9º",
+      "esperado": [{"documento": "regulamento-interno", "contem": "48 (quarenta e oito) horas"}],
+      "formas": {"tecnica": "Qual o prazo para entrega do atestado médico ao setor de pessoal?",
+                 "leiga": "fiquei doente, até quando eu entrego o papel do médico?",
+                 "curta": "atestado prazo"}
+    },
+    {
+      "id": "reg-programas", "trecho": "Regulamento, art. 10",
+      "esperado": [{"documento": "regulamento-interno", "contem": "vedada a instalacao de programas"},
+                   {"documento": "manual-do-colaborador", "contem": "nao instale programas"}],
+      "formas": {"tecnica": "É permitida a instalação de programas nos equipamentos de informática da Cooperativa?",
+                 "leiga": "posso baixar um jogo no computador do trabalho?",
+                 "curta": "instalar sofware"}
+    },
+    {
+      "id": "reg-sigilo", "trecho": "Regulamento, art. 11",
+      "esperado": [{"documento": "regulamento-interno", "contem": "mesmo apos o termino do vinculo"},
+                   {"documento": "contrato-modelo", "contem": "nao divulgara dados de cooperados"},
+                   {"documento": "manual-do-colaborador", "contem": "o sigilo segue o art. 11"}],
+      "formas": {"tecnica": "O dever de sigilo sobre informações de cooperados e clientes permanece após o término do vínculo?",
+                 "leiga": "depois que eu sair da empresa posso contar para os outros os dados dos clientes?",
+                 "curta": "sigilo depois de sair"}
+    },
+    {
+      "id": "reg-treinamento", "trecho": "Regulamento, art. 13",
+      "esperado": [{"documento": "regulamento-interno", "contem": "treinamento de integracao"}],
+      "formas": {"tecnica": "Qual a carga horária mínima do treinamento de integração para recém-contratados?",
+                 "leiga": "quem acabou de ser contratado faz algum curso no começo?",
+                 "curta": "treinamento novato"}
+    },
+    {
+      "id": "reg-sancoes", "trecho": "Regulamento, art. 14",
+      "esperado": [{"documento": "regulamento-interno", "contem": "advertencia verbal"}],
+      "formas": {"tecnica": "Quais sanções disciplinares se aplicam ao descumprimento do Regulamento?",
+                 "leiga": "o que acontece comigo se eu não seguir as regras?",
+                 "curta": "punicao"}
+    },
+    {
+      "id": "reg-auxilio-remoto", "trecho": "Regulamento, art. 17",
+      "esperado": [{"documento": "regulamento-interno", "contem": "r$ 150,00"}],
+      "formas": {"tecnica": "Qual o valor do auxílio mensal pago ao colaborador em trabalho remoto?",
+                 "leiga": "a empresa me ajuda a pagar a luz e a internet quando trabalho em casa?",
+                 "curta": "auxilio internet"}
+    },
+    {
+      "id": "reg-vigencia", "trecho": "Regulamento, art. 16",
+      "esperado": [{"documento": "regulamento-interno", "contem": "entra em vigor na data de sua aprovacao"}],
+      "formas": {"tecnica": "Quando o Regulamento Interno entra em vigor?",
+                 "leiga": "a partir de quando essas regras começam a valer?",
+                 "curta": "vigencia do regulamento"}
+    },
+    {
+      "id": "reg-abrangencia", "trecho": "Regulamento, art. 2º",
+      "esperado": [{"documento": "regulamento-interno", "contem": "estagiarios e prestadores de servico"}],
+      "formas": {"tecnica": "A quem se aplicam as normas do Regulamento Interno?",
+                 "leiga": "estagiário também tem que seguir essas regras?",
+                 "curta": "estagiario regras"}
+    },
+    {
+      "id": "con-objeto", "trecho": "Contrato, cláusula primeira",
+      "esperado": [{"documento": "contrato-modelo", "contem": "servicos de apoio administrativo"}],
+      "formas": {"tecnica": "Qual é o objeto do contrato de prestação de serviços?",
+                 "leiga": "o contratado vai fazer que tipo de trabalho?",
+                 "curta": "objeto do contrato"}
+    },
+    {
+      "id": "con-foro", "trecho": "Contrato, cláusula nona",
+      "esperado": [{"documento": "contrato-modelo", "contem": "comarca de joao pessoa"}],
+      "formas": {"tecnica": "Qual o foro eleito para dirimir dúvidas oriundas do contrato?",
+                 "leiga": "se der briga na justiça, em que cidade vai ser o processo?",
+                 "curta": "foro"}
+    },
+    {
+      "id": "con-danos", "trecho": "Contrato, cláusula sétima",
+      "esperado": [{"documento": "contrato-modelo", "contem": "responde pelos danos que causar"},
+                   {"documento": "manual-do-colaborador", "contem": "danos causados a terceiros"}],
+      "formas": {"tecnica": "Como se dá a responsabilidade civil do contratado pelos danos que causar?",
+                 "leiga": "se eu quebrar uma coisa de outra pessoa, quem paga?",
+                 "curta": "dano a terceiros"}
+    },
+    {
+      "id": "con-transporte", "trecho": "Contrato, cláusula quinta",
+      "esperado": [{"documento": "contrato-modelo", "contem": "vale-transporte sera concedido"},
+                   {"documento": "manual-do-colaborador", "contem": "beneficio de transporte"}],
+      "formas": {"tecnica": "Em que termos é concedido o vale-transporte?",
+                 "leiga": "a empresa paga meu ônibus para eu ir trabalhar?",
+                 "curta": "vale transporte"}
+    },
+    {
+      "id": "man-etica", "trecho": "Manual, item 8",
+      "esperado": [{"documento": "manual-do-colaborador", "contem": "canal de etica"}],
+      "formas": {"tecnica": "Qual o canal para denúncias de assédio ou fraude?",
+                 "leiga": "sofri assédio do meu chefe, onde eu reclamo sem me identificar?",
+                 "curta": "denuncia anonima"}
+    },
+    {
+      "id": "man-vestimenta", "trecho": "Manual, item 7",
+      "esperado": [{"documento": "manual-do-colaborador", "contem": "a roupa e livre"}],
+      "formas": {"tecnica": "Qual a regra de vestimenta nas áreas administrativas?",
+                 "leiga": "posso ir de bermuda para o escritório?",
+                 "curta": "roupa no escritorio"}
+    },
+    {
+      "id": "man-senha", "trecho": "Manual, item 6",
+      "esperado": [{"documento": "manual-do-colaborador", "contem": "nao compartilhe sua senha"}],
+      "formas": {"tecnica": "Quais cuidados de segurança da informação o colaborador deve adotar?",
+                 "leiga": "posso passar minha senha para um colega?",
+                 "curta": "compartilhar senha"}
+    },
+    {
+      "id": "man-expediente", "trecho": "Manual, item 2",
+      "esperado": [{"documento": "manual-do-colaborador", "contem": "expediente vai das 8h"}],
+      "formas": {"tecnica": "Qual o horário do expediente de segunda a sexta?",
+                 "leiga": "que horas começa e termina o trabalho?",
+                 "curta": "horario expediente"}
+    },
+    {
+      "id": "edi-taxa", "trecho": "Edital, item 4",
+      "esperado": [{"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "nao cobrara taxa"}],
+      "formas": {"tecnica": "O processo seletivo cobra taxa de inscrição?",
+                 "leiga": "tenho que pagar alguma coisa para me inscrever no mestrado?",
+                 "curta": "taxa inscriçao"}
+    },
+    {
+      "id": "edi-vagas", "trecho": "Edital, item 5.1",
+      "esperado": [{"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "36 (trinta e seis) vagas"},
+                   {"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "maximo de 36 vagas"}],
+      "formas": {"tecnica": "Quantas vagas são oferecidas para o mestrado e para o doutorado?",
+                 "leiga": "quantas pessoas eles vão aceitar no mestrado?",
+                 "curta": "numero de vagas"}
+    },
+    {
+      "id": "edi-cotas", "trecho": "Edital, item 5.3",
+      "esperado": [{"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "20% serao destinadas"}],
+      "formas": {"tecnica": "Qual o percentual de vagas reservadas às ações afirmativas?",
+                 "leiga": "tem cota para negros e indígenas?",
+                 "curta": "cotas"}
+    },
+    {
+      "id": "edi-inscricoes", "trecho": "Edital, item 1.1 e cronograma",
+      "esperado": [{"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "03 a 07 de novembro de 2026"},
+                   {"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "03/11/2026 a 07/11/2026 periodo de inscricoes"}],
+      "formas": {"tecnica": "Qual o período de inscrições do processo seletivo?",
+                 "leiga": "até quando eu posso me inscrever?",
+                 "curta": "prazo inscricao"}
+    },
+    {
+      "id": "edi-nota-lattes", "trecho": "Edital, itens 7.3 e 9.1",
+      "esperado": [{"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "pontuacao inferior a 10 (dez) pontos"},
+                   {"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "igual ou superior a 10 pontos"}],
+      "formas": {"tecnica": "Qual a pontuação mínima na avaliação do Currículo Lattes para o mestrado?",
+                 "leiga": "quantos pontos no currículo eu preciso para não ser eliminado?",
+                 "curta": "nota minima lates"}
+    },
+    {
+      "id": "edi-nota-projeto", "trecho": "Edital, itens 7.3 e 9.1",
+      "esperado": [{"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "igual ou superior a 70"}],
+      "formas": {"tecnica": "Qual a nota mínima para aprovação na avaliação da proposta de projeto de pesquisa?",
+                 "leiga": "quanto eu preciso tirar no projeto para passar?",
+                 "curta": "nota do projeto"}
+    },
+    {
+      "id": "edi-paginas", "trecho": "Edital, item 8.2, g",
+      "esperado": [{"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "nao podera exceder 2 paginas"}],
+      "formas": {"tecnica": "Qual o número máximo de páginas da proposta de projeto de pesquisa?",
+                 "leiga": "meu projeto pode ter quantas folhas?",
+                 "curta": "limite de paginas"}
+    },
+    {
+      "id": "edi-desempate", "trecho": "Edital, item 10",
+      "esperado": [{"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "idade mais elevada"}],
+      "formas": {"tecnica": "Quais são os critérios de desempate entre candidatos?",
+                 "leiga": "se dois candidatos tirarem a mesma nota, quem fica com a vaga?",
+                 "curta": "desempate"}
+    },
+    {
+      "id": "edi-recurso", "trecho": "Edital, item 12.3",
+      "esperado": [{"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "prazo maximo de 10 (dez) dias"}],
+      "formas": {"tecnica": "Qual o prazo para interposição de recurso contra o resultado final?",
+                 "leiga": "não concordei com o resultado, quanto tempo eu tenho para reclamar?",
+                 "curta": "recurso resultado final"}
+    },
+    {
+      "id": "edi-remarcacao", "trecho": "Edital, item 8.7",
+      "esperado": [{"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "nenhuma hipotese havera segunda chamada"}],
+      "formas": {"tecnica": "Existe possibilidade de segunda chamada ou remarcação da defesa do projeto?",
+                 "leiga": "fiquei doente no dia da apresentação, posso apresentar outro dia?",
+                 "curta": "remarcar apresentaçao"}
+    },
+    {
+      "id": "edi-atendimento", "trecho": "Edital, item 13",
+      "esperado": [{"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "de segunda a sexta de 8:00h"}],
+      "formas": {"tecnica": "Qual o horário e o local de atendimento aos candidatos na secretaria do programa?",
+                 "leiga": "onde eu posso tirar minhas dúvidas sobre a seleção pessoalmente?",
+                 "curta": "secretaria horario"}
+    },
+    {
+      "id": "edi-matricula-docs", "trecho": "Edital, item 15.1",
+      "esperado": [{"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "foto 3x4"}],
+      "formas": {"tecnica": "Quais documentos devem ser enviados para a matrícula institucional dos aprovados?",
+                 "leiga": "passei na seleção, o que eu tenho que mandar para me matricular?",
+                 "curta": "documentos matricula"}
+    },
+    {
+      "id": "edi-heteroidentificacao", "trecho": "Edital, item 3",
+      "esperado": [{"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "carater deliberativo"}],
+      "formas": {"tecnica": "Como funciona o procedimento de heteroidentificação dos candidatos autodeclarados negros?",
+                 "leiga": "quem se declarou pardo vai passar por alguma verificação?",
+                 "curta": "heteroidentificaçao"}
+    },
+    {
+      "id": "edi-apresentacao-online", "trecho": "Edital, item 8.5",
+      "esperado": [{"documento": "edital-processo-seletivo-ppgi-2027-1", "contem": "google meet"}],
+      "formas": {"tecnica": "Como será realizada a apresentação oral da proposta de projeto?",
+                 "leiga": "a entrevista do projeto é presencial ou pela internet?",
+                 "curta": "apresentacao online"}
+    }
+  ]
+}

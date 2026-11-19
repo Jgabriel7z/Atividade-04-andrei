@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import List, Dict, Optional, Generator
 from dotenv import load_dotenv
 from groq import Groq
@@ -14,13 +15,17 @@ MAX_HISTORY_TURNS = 10          # pares (user + assistant) mantidos no históric
 MAX_CONTEXT_CHARS = 12_000      # caracteres máximos do bloco de contexto RAG
 MAX_TOTAL_MSG_CHARS = 24_000    # teto total de todos os conteúdos somados
 
+# O llama-3.3-70b-versatile, modelo original do projeto, saiu do Groq.
+# GROQ_MODEL no .env troca o modelo sem mexer no código.
+DEFAULT_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+
 
 class LLMChain:
     """Gerenciador de cadeia de LLM com Groq."""
 
     def __init__(
         self,
-        model: str = "llama-3.3-70b-versatile",
+        model: str = DEFAULT_MODEL,
         temperature: float = 0.7,
         max_tokens: int = 1024,
         top_p: float = 1.0,
@@ -212,6 +217,121 @@ class LLMChain:
         summary = response.choices[0].message.content.strip()
         logger.info(f"Resumo de mudança gerado ({len(summary)} chars)")
         return summary
+
+    # ── Verificação de dependência (análise de impacto) ──────
+
+    DEPENDENCY_SYSTEM_PROMPT = (
+        "Você confere avisos de impacto entre documentos. Um artigo de um documento "
+        "mudou (ou foi retirado) e um trecho de OUTRO documento foi apontado como "
+        "possível dependente. O trecho depende do artigo quando repete, aplica, "
+        "resume ou pressupõe a regra do artigo, de modo que a mudança pode deixar o "
+        "trecho desatualizado, errado ou sem base. Falar de assunto só parecido "
+        "(outro tipo de prazo, outro pagamento, outra instituição, outras pessoas) "
+        "NÃO é depender. Na dúvida, responda que não depende. "
+        'Responda só com JSON: {"depende": true ou false, "motivo": "uma frase curta, '
+        'em português simples, para quem não é da área jurídica"}.'
+    )
+    DEPENDENCY_TIMEOUT = 20.0
+
+    def verify_dependency(self, article_before: str, article_after: str,
+                          passage: str) -> "tuple[bool, str]":
+        """
+        O trecho `passage` (de outro documento) depende do artigo que mudou?
+        Devolve (depende, motivo). É o `verificar` de impact.analyze_impact.
+
+        Chamada avulsa, como summarize_change: não usa nem altera
+        conversation_history. Resposta fora do formato levanta ValueError;
+        a análise de impacto trata o erro mantendo a sugestão sem confirmação.
+        """
+        import json
+        import re
+
+        user = (
+            f"ARTIGO ANTES DA MUDANÇA:\n{article_before[:3000]}\n\n"
+            f"ARTIGO DEPOIS DA MUDANÇA:\n{article_after[:3000]}\n\n"
+            f"TRECHO DO OUTRO DOCUMENTO:\n{passage[:2000]}\n\n"
+            "O trecho depende do artigo?"
+        )
+        extra = {"reasoning_effort": "low"} if "gpt-oss" in self.model else {}
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": self.DEPENDENCY_SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.0,
+            max_completion_tokens=400,
+            stream=False,
+            timeout=self.DEPENDENCY_TIMEOUT,
+            **extra,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        m = re.search(r"\{.*\}", text, re.S)
+        if not m:
+            raise ValueError(f"resposta fora do formato: {text[:120]!r}")
+        data = json.loads(m.group(0))
+        depende = data.get("depende")
+        if isinstance(depende, str):
+            depende = depende.strip().lower() in ("true", "sim", "yes")
+        if not isinstance(depende, bool):
+            raise ValueError(f"resposta sem 'depende': {text[:120]!r}")
+        return depende, " ".join(str(data.get("motivo", "")).split())
+
+    # ── Reescrita da pergunta para a busca ───────────────────
+
+    REWRITE_SYSTEM_PROMPT = (
+        "Você ajuda um sistema de busca em documentos normativos (regulamentos, "
+        "contratos, manuais, editais, leis). Reescreva a pergunta do usuário em "
+        "3 variantes: a primeira como o próprio documento escreveria, com os termos "
+        "formais ou jurídicos; a segunda em linguagem simples, com sinônimos comuns; "
+        "a terceira só com as palavras-chave principais, com a ortografia corrigida.\n"
+        "Responda APENAS com as 3 linhas, sem numeração, títulos ou comentários.\n"
+        "Não responda à pergunta. Não acrescente valores, datas, números de artigo "
+        "nem fatos que não estejam na pergunta.\n\n"
+        "Exemplo para 'posso levar meu cachorro pro serviço?':\n"
+        "É permitida a entrada de animais de estimação nas dependências do local de trabalho?\n"
+        "Posso levar meu bicho de estimação para o trabalho?\n"
+        "animais de estimação local de trabalho permissão"
+    )
+
+    def reescrever_pergunta(self, pergunta: str, timeout: float = 8.0) -> List[str]:
+        """
+        Variantes da pergunta para a busca (busca.buscar(..., reescrever=...)).
+
+        Chamada avulsa, como summarize_change: NÃO usa nem altera
+        conversation_history. Levanta exceção em caso de erro; quem chama
+        (busca.buscar) ignora a falha e segue com a pergunta original.
+        """
+        extra = {}
+        if self.model.startswith("openai/gpt-oss"):
+            extra["reasoning_effort"] = "low"     # menos latência; a tarefa é simples
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": self.REWRITE_SYSTEM_PROMPT},
+                {"role": "user", "content": pergunta},
+            ],
+            temperature=0.2,
+            max_completion_tokens=600,
+            top_p=1.0,
+            stream=False,
+            timeout=timeout,
+            **extra,
+        )
+        text = response.choices[0].message.content or ""
+        # Modelos com raciocínio visível (qwen) podem devolver <think>…</think>.
+        if "</think>" in text:
+            text = text.split("</think>")[-1]
+        variantes = []
+        for line in text.splitlines():
+            line = line.strip().lstrip("-*•").strip()
+            if line[:2] in ("1)", "2)", "3)", "1.", "2.", "3."):
+                line = line[2:].strip()
+            # Linha que repete a instrução ("em linguagem simples:") não é variante.
+            if line and not line.endswith(":") and line not in variantes:
+                variantes.append(line)
+        logger.info(f"Pergunta reescrita em {len(variantes)} variantes")
+        return variantes[:3]
 
 
 # ── Função auxiliar ──────────────────────────────────────────

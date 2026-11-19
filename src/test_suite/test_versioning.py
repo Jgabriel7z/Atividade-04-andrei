@@ -147,6 +147,19 @@ def test_versioning() -> Tuple[int, int]:
         store = VersionStore(tmp / "a.db")
         assert store.get_current("reg").sha256 == "bb"
 
+    def t_store_tempo_real():
+        # O que cada tela usa para saber se outra pessoa publicou algo
+        store = VersionStore(tmp / "rt.db")
+        assert store.last_change() == 0
+        store.ensure_document("reg", "Regulamento")
+        store.add_version("reg", 1, filename="r1.pdf", sha256="aa", text=V1, author="Ana")
+        visto = store.last_change()
+        assert visto > 0 and store.versions_since(visto) == []
+        store.add_version("reg", 2, filename="r2.pdf", sha256="bb", text=V2, author="Bruno")
+        novas = store.versions_since(visto)
+        assert [(n, v.version, v.author) for _, n, v in novas] == [("Regulamento", 2, "Bruno")]
+        assert novas[0][0] == store.last_change()
+
     # ── publish_version ─────────────────────────────────────
 
     def t_publish():
@@ -282,6 +295,7 @@ def test_versioning() -> Tuple[int, int]:
     runner.run("Identificador do documento (slug)",          t_slugify)
     runner.run("SQLite: autor, data, motivo, SHA-256",       t_store_registro)
     runner.run("SQLite: persiste ao reabrir",                t_store_persiste)
+    runner.run("SQLite: versões novas desde a última olhada", t_store_tempo_real)
     runner.run("publish_version cria versões sem apagar",    t_publish)
     runner.run("Mesmo arquivo não gera versão nova",         t_publish_mesmo_arquivo)
     runner.run("Vários documentos na mesma base",            t_publish_varios_documentos)

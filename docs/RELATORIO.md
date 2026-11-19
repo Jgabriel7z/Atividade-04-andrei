@@ -59,3 +59,15 @@ Usamos o Claude Code (modelo Claude Opus) no repositório clonado, numa branch p
 ## 5. O que aprendemos
 
 [preencher pela equipe]
+
+## 6. Segunda rodada: teste em dupla
+
+Em 2026-11-19 a dupla usou o sistema ao mesmo tempo, cada um no seu computador (VPN até o app no computador do João). O teste mostrou o que o uso individual não mostrava: o envio que travava, nada em tempo real, falta de navegação entre documentos e de conversa entre as pessoas, busca que dependia das palavras exatas, sugestões falsas entre documentos de temas diferentes e uma interface difícil para quem não conhece os termos.
+
+Com o agente, a correção foi dividida em três frentes paralelas (interface, busca e sugestões), cada uma medida antes de mudar. Números principais:
+- busca, 40 perguntas escritas de 3 formas: acerto nos 5 primeiros de 71,7% para 88,3% (a reescrita da pergunta que o app fazia derrubava para 51,7%);
+- CF/88 no caminho da interface: 83,3% para 95,8%;
+- sugestões falsas no caso real (edital e proposta de mestrado contra o regulamento): de 7 para 0, mantendo os critérios 1 a 3;
+- 97 testes automáticos passando.
+
+Entraram também itens que a Atividade 03 deixou fora do escopo, a pedido do teste: login, escolha do modelo e avisos dentro do app. Detalhes, conferência com o plano e limites em [TESTE_EM_DUPLA.md](TESTE_EM_DUPLA.md).
