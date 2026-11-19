@@ -20,11 +20,13 @@ import inspect
 import logging
 import os
 import re
+import shutil
 import socket
 import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 from ingester import extract_text_from_pdf
 from llm_chain import DEFAULT_MODEL, LLMChain
@@ -45,7 +47,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ALL_DOCS = "__todos__"
 NOVO_DOC = "__novo__"
 REFRESH_SECONDS = 3
-SECOES = ["Texto atual", "Mudanças", "Histórico", "Conversa"]
+SECOES = ["Documento", "Mudanças", "Histórico", "Conversa"]
 
 CONTAS = ler_contas()
 NOMES = {c.login: c.nome for c in CONTAS}
@@ -421,6 +423,8 @@ def _registrar(arquivo, destino: str, nome_novo: str, autor: str, motivo: str, a
         sha256=sha256_file(caminho), author=autor or "", reason=(motivo or "").strip(),
         aliases=[nome] + lista_apelidos, document_id=existente.id if existente else None,
     )
+    if res.status == "created":
+        _guardar_pdf(caminho, res.document.id, res.version.version)
     impacto = resumo = None
     if res.status == "created" and res.diff is not None:
         impacto = _analisar_impacto(res.document.id, res.diff, llm)
@@ -430,17 +434,91 @@ def _registrar(arquivo, destino: str, nome_novo: str, autor: str, motivo: str, a
     return res, impacto, resumo
 
 
-def _texto_atual_md(doc_id: Optional[str]) -> str:
+# ─── PDFs guardados ───────────────────────────────────────────────────────────
+# Cada versão guarda o PDF original ao lado do registro de versões
+# (data/pdfs/<documento>/v<N>.pdf), para a tela mostrar o arquivo de verdade.
+
+def pasta_pdfs() -> Path:
+    return (get_store().db_path.parent / "pdfs").resolve()
+
+
+def _pdf_da_versao(doc_id: str, versao: int) -> Path:
+    return pasta_pdfs() / doc_id / f"v{versao}.pdf"
+
+
+def _guardar_pdf(origem, doc_id: str, versao: int) -> None:
+    try:
+        destino = _pdf_da_versao(doc_id, versao)
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(str(origem), destino)
+    except OSError as e:                # sem o PDF, a tela mostra o texto extraído
+        logger.warning(f"Não deu para guardar o PDF de {doc_id} v{versao}: {e}")
+
+
+def _url_arquivo(caminho: Path) -> str:
+    """Endereço que o Gradio serve (a pasta dos PDFs entra em allowed_paths no launch)."""
+    return "/gradio_api/file=" + quote(caminho.as_posix(), safe="/:")
+
+
+def _visualizacao(doc_id: Optional[str]) -> str:
+    """O PDF da versão atual dentro da página, com o leitor do próprio navegador."""
+    if not doc_id:
+        return ""
+    atual = get_store().get_current(doc_id)
+    if atual is None:
+        return ""
+    pdf = _pdf_da_versao(doc_id, atual.version)
+    if not pdf.exists():
+        return ("<div class='suave aviso-pdf'>A pré-visualização não está disponível: este "
+                "arquivo foi enviado antes de o EixoAI guardar os PDFs. Abaixo, o texto extraído "
+                "dele. Envie o PDF de novo como nova versão para ver o arquivo aqui.</div>")
+    url = _url_arquivo(pdf)
+    return (f"<iframe class='visor-pdf' src='{url}#view=FitH' title='PDF'></iframe>"
+            f"<div class='suave'><a href='{url}' target='_blank' rel='noopener'>Abrir o PDF "
+            f"em outra aba</a></div>")
+
+
+def _paragrafos(texto: str) -> List[str]:
+    """
+    Junta as linhas do texto extraído em parágrafos. Alguns PDFs (o edital do
+    PPGI, por exemplo) saem com uma quebra de linha depois de cada palavra.
+    O mesmo edital põe uma linha só com espaço entre as palavras, então linha em
+    branco só fecha o parágrafo se a anterior termina em pontuação de fim de
+    frase. Também começa parágrafo novo quando a linha anterior termina em ponto
+    e a atual começa com maiúscula, número, "Art." ou "§".
+    """
+    paragrafos, atual = [], []
+    for linha in texto.splitlines():
+        linha = linha.strip()
+        if not linha:
+            if atual and atual[-1].endswith((".", ":", ";", "!", "?")):
+                paragrafos.append(" ".join(atual))
+                atual = []
+            continue
+        novo = bool(atual) and atual[-1].endswith((".", ":", ";", "!", "?")) and \
+            (linha[:1].isupper() or linha[:1].isdigit() or linha.startswith(("Art.", "§")))
+        if novo:
+            paragrafos.append(" ".join(atual))
+            atual = []
+        atual.append(linha)
+    if atual:
+        paragrafos.append(" ".join(atual))
+    return [" ".join(p.split()) for p in paragrafos]
+
+
+def _texto_atual_md(doc_id: Optional[str], so_sem_pdf: bool = False) -> str:
     """Texto da versão atual, com cada artigo em destaque, para ler na tela."""
     if not doc_id:
         return ""
     atual = get_store().get_current(doc_id)
     if atual is None:
         return "_Sem versão registrada._"
+    if so_sem_pdf and _pdf_da_versao(doc_id, atual.version).exists():
+        return ""
     texto = get_store().get_version(doc_id, atual.version).text
     artigos = split_articles(texto)
     if len(artigos) <= 1:
-        return "\n\n".join(md_escape(l.strip()) for l in texto.splitlines() if l.strip())
+        return "\n\n".join(md_escape(p) for p in _paragrafos(texto))
     out = []
     for a in artigos:
         corpo = " ".join(a.text.split())
@@ -472,13 +550,29 @@ def _cabecalho_doc(doc_id: Optional[str]) -> str:
             + (f" · {html.escape(atual.reason)}" if atual.reason else "") + "</div></div>")
 
 
-def _historico(doc_id: Optional[str]) -> List[List]:
+def _historico(doc_id: Optional[str]) -> str:
+    """Tabela das versões (a mais nova em cima). Texto longo quebra em vez de vazar."""
     if not doc_id:
-        return []
-    return [[f"v{v.version}" + (" (atual)" if v.is_current else ""),
-             quando_humano(v.created_at), v.author or "—", v.reason or "—", v.filename,
-             v.sha256[:12]]
-            for v in reversed(get_store().list_versions(doc_id))]
+        return ""
+    vs = list(reversed(get_store().list_versions(doc_id)))
+    linhas = []
+    for v in vs:
+        pdf = _pdf_da_versao(doc_id, v.version)
+        nome = html.escape(v.filename)
+        arquivo = (f"<a href='{_url_arquivo(pdf)}' target='_blank' rel='noopener'>{nome}</a>"
+                   if pdf.exists() else nome)
+        atual = " <span class='selo'>atual</span>" if v.is_current else ""
+        linhas.append(
+            f"<tr><td><b>{v.version}</b>{atual}</td><td>{quando_humano(v.created_at)}</td>"
+            f"<td>{html.escape(v.author or '—')}</td><td>{html.escape(v.reason or '—')}</td>"
+            f"<td class='arquivo'>{arquivo}<div class='codigo' title='Código de verificação "
+            f"(SHA-256): muda se o arquivo mudar'>{v.sha256[:12]}</div></td></tr>")
+    nota = ("" if len(vs) > 1 else "<div class='suave nota-hist'>Só há uma versão. Quando alguém "
+            "enviar outra, dá para comparar as duas aqui embaixo.</div>")
+    return ("<table class='historico'><colgroup><col style='width:13%'><col style='width:16%'>"
+            "<col style='width:17%'><col style='width:24%'><col style='width:30%'></colgroup>"
+            "<thead><tr><th>Versão</th><th>Quando</th><th>Quem enviou</th><th>O que mudou</th>"
+            f"<th>Arquivo</th></tr></thead><tbody>{''.join(linhas)}</tbody></table>{nota}")
 
 
 def _versoes_escolha(doc_id: Optional[str]) -> List[Tuple[str, int]]:
@@ -665,8 +759,9 @@ def nova_conversa(llm):
 def _painel_doc(doc_id: Optional[str], secao: str, eu: str) -> Dict:
     """Atualizações do painel do documento: cabeçalho e a seção visível."""
     out = {doc_cab: _cabecalho_doc(doc_id)}
-    if secao == "Texto atual":
-        out[doc_texto] = _texto_atual_md(doc_id)
+    if secao == "Documento":
+        out[doc_pdf] = _visualizacao(doc_id)
+        out[doc_texto] = _texto_atual_md(doc_id, so_sem_pdf=True)
     elif secao == "Histórico":
         out[doc_hist] = _historico(doc_id)
         vs = _versoes_escolha(doc_id)
@@ -683,7 +778,7 @@ def _painel_doc(doc_id: Optional[str], secao: str, eu: str) -> Dict:
 
 
 def _visibilidade(secao: str) -> Dict:
-    return {sec_texto: gr.update(visible=secao == "Texto atual"),
+    return {sec_texto: gr.update(visible=secao == "Documento"),
             sec_mud: gr.update(visible=secao == "Mudanças"),
             sec_hist: gr.update(visible=secao == "Histórico"),
             sec_conv: gr.update(visible=secao == "Conversa")}
@@ -762,7 +857,7 @@ def enviar_arquivo(arquivo, destino, nome_novo, motivo, apelidos, modelo, llm, m
             f"(versão {res.version.version}). Nada foi criado.")
         return out
     v_antes = res.previous.version if res.previous else None
-    nova_secao = "Mudanças" if v_antes else "Texto atual"
+    nova_secao = "Mudanças" if v_antes else "Documento"
     out[secao] = nova_secao
     out.update(_visibilidade(nova_secao))
     if v_antes:
@@ -897,8 +992,9 @@ def a_cada_instante(v_visto, m_visto, mine, aba_atual, doc_id, sec, escopo_atual
             out[doc_lista] = gr.update(choices=_lista_docs())
             out[envio_destino] = gr.update(choices=_destinos_envio())
             out[doc_cab] = _cabecalho_doc(doc_id)
-            if sec == "Texto atual":
-                out[doc_texto] = _texto_atual_md(doc_id)
+            if sec == "Documento":
+                out[doc_pdf] = _visualizacao(doc_id)
+                out[doc_texto] = _texto_atual_md(doc_id, so_sem_pdf=True)
             elif sec == "Histórico":
                 out.update(_painel_doc(doc_id, sec, eu))
         if mudou_m and sec == "Conversa" and doc_id:
@@ -921,6 +1017,30 @@ def a_cada_instante(v_visto, m_visto, mine, aba_atual, doc_id, sec, escopo_atual
 CUSTOM_CSS = f"""
 @import url('https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600&f[]=clash-display@500,600&display=swap');
 
+:root {{ color-scheme: dark; }}
+* {{ scrollbar-color: rgba(238,243,240,.22) transparent; scrollbar-width: thin; }}
+::-webkit-scrollbar {{ width: 8px; height: 8px; }}
+::-webkit-scrollbar-track {{ background: transparent; }}
+::-webkit-scrollbar-thumb {{ background: rgba(238,243,240,.22); border-radius: 999px; }}
+::-webkit-scrollbar-corner {{ background: transparent; }}
+.visor-pdf {{ width: 100%; height: calc(100vh - 300px); min-height: 420px; border: 1px solid var(--linha);
+              border-radius: 10px; background: #fff; display: block; margin-bottom: 6px; }}
+.aviso-pdf {{ border: 1px dashed var(--linha); border-radius: 10px; padding: 10px 14px; margin-bottom: 8px; }}
+#doc-texto {{ overflow-x: hidden; overflow-wrap: anywhere; }}
+table.historico {{ width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0;
+                   font-size: 14px; border: 1px solid var(--linha); border-radius: 10px; }}
+table.historico th {{ text-align: left; font-weight: 500; color: var(--suave); font-size: 13px;
+                      padding: 10px 12px; border-bottom: 1px solid var(--linha); background: transparent; }}
+table.historico td {{ padding: 10px 12px; border-bottom: 1px solid var(--linha); vertical-align: top;
+                      overflow-wrap: anywhere; word-break: break-word; background: transparent; }}
+table.historico tr:last-child td {{ border-bottom: 0; }}
+table.historico th, table.historico td {{ border-left: 0 !important; border-right: 0 !important;
+    border-top: 0 !important; border-color: var(--linha) !important; }}
+table.historico .codigo {{ font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--suave);
+                           margin-top: 2px; }}
+.nota-hist {{ margin-top: 8px; }}
+.selo {{ display: inline-block; margin-left: 6px; padding: 0 8px; border-radius: 999px; font-size: 11px;
+         border: 1px solid rgba(61,219,195,.5); color: var(--destaque); }}
 :root {{ --fundo:{FUNDO}; --painel:{PAINEL}; --linha:{LINHA}; --texto:{TEXTO};
          --suave:{SUAVE}; --destaque:{DESTAQUE}; --atencao:{ATENCAO}; }}
 .gradio-container {{ background: var(--fundo) !important; max-width: 1280px !important;
@@ -1055,26 +1175,28 @@ with gr.Blocks(title="EixoAI") as demo:
                     doc_lista = gr.Radio(label="Documentos da equipe", choices=[], value=None,
                                          elem_id="doc-lista")
                     with gr.Accordion("Enviar arquivo", open=False):
-                        envio_arquivo = gr.File(label="Arquivo PDF", file_types=[".pdf"], height=110)
+                        envio_arquivo = gr.File(label="Arquivo PDF", file_types=[".pdf"], height=140)
                         envio_destino = gr.Dropdown(label="Este arquivo é", value=NOVO_DOC,
                                                     choices=[("Um documento novo", NOVO_DOC)])
                         with gr.Column(visible=True) as envio_nome_box:
-                            envio_nome = gr.Textbox(label="Nome do documento",
-                                                    placeholder="Se ficar vazio, usa o nome do arquivo")
+                            envio_nome = gr.Textbox(label="Nome do documento", max_lines=1,
+                                                    placeholder="Ex.: Regulamento Interno",
+                                                    info="Vazio: usa o nome do arquivo")
                         envio_motivo = gr.Textbox(label="O que mudou? (opcional)", lines=2,
-                                                  placeholder="Ex.: prazo de reembolso caiu para 15 dias")
+                                                  max_lines=4, placeholder="Ex.: reembolso em 15 dias")
                         with gr.Accordion("Mais opções", open=False):
                             envio_apelidos = gr.Textbox(
-                                label="Outros nomes usados para citar este documento",
-                                placeholder="Ex.: Regulamento, RI (separados por vírgula)")
+                                label="Outros nomes usados para citar este documento", max_lines=1,
+                                placeholder="Ex.: Regulamento, RI", info="Separados por vírgula")
                         btn_enviar = gr.Button("Enviar", variant="primary", elem_id="btn-enviar")
                         envio_status = gr.HTML("")
 
                 with gr.Column(scale=3):
                     doc_cab = gr.HTML(_cabecalho_doc(None))
-                    secao = gr.Radio(choices=SECOES, value="Texto atual", show_label=False,
+                    secao = gr.Radio(choices=SECOES, value="Documento", show_label=False,
                                      elem_id="secao", container=False)
                     with gr.Column(visible=True) as sec_texto:
+                        doc_pdf = gr.HTML("")
                         doc_texto = gr.Markdown("", elem_id="doc-texto")
                     with gr.Column(visible=False) as sec_mud:
                         with gr.Column(elem_id="mud-rolagem"):
@@ -1086,10 +1208,7 @@ with gr.Blocks(title="EixoAI") as demo:
                             with gr.Accordion("Ver o texto de antes e de depois", open=False):
                                 mud_detalhe = gr.Markdown("")
                     with gr.Column(visible=False) as sec_hist:
-                        doc_hist = gr.Dataframe(
-                            headers=["Versão", "Quando", "Quem enviou", "O que mudou", "Arquivo",
-                                     "Código de verificação"],
-                            value=[], interactive=False, wrap=True)
+                        doc_hist = gr.HTML("")
                         with gr.Row():
                             cmp_a = gr.Dropdown(label="Comparar a versão", choices=[], scale=2)
                             cmp_b = gr.Dropdown(label="com a versão", choices=[], scale=2)
@@ -1131,7 +1250,7 @@ with gr.Blocks(title="EixoAI") as demo:
                    show_progress="hidden")
 
     # Documentos
-    painel = [doc_cab, doc_texto, doc_hist, cmp_a, cmp_b, doc_conversa,
+    painel = [doc_cab, doc_pdf, doc_texto, doc_hist, cmp_a, cmp_b, doc_conversa,
               mud_alerta, mud_resumo, mud_impacto, mud_detalhe]
     secoes = [sec_texto, sec_mud, sec_hist, sec_conv]
     preencher_args = dict(fn=preencher,
@@ -1181,7 +1300,7 @@ with gr.Blocks(title="EixoAI") as demo:
         inputs=[visto_versao, visto_msg, mine_state, aba, doc_lista, secao, escopo, topo_cache,
                 online_cache],
         outputs=[visto_versao, visto_msg, topo, topo_cache, escopo, doc_lista, envio_destino,
-                 doc_cab, doc_texto, doc_hist, cmp_a, cmp_b, doc_conversa, geral_conversa,
+                 doc_cab, doc_pdf, doc_texto, doc_hist, cmp_a, cmp_b, doc_conversa, geral_conversa,
                  atividade, quem_aqui, online_cache],
         show_progress="hidden",
         concurrency_limit=None,      # consulta rápida; não espera na fila dos envios
@@ -1224,6 +1343,7 @@ if __name__ == "__main__":
     print()
     demo.launch(
         share=publico, server_name="0.0.0.0", server_port=porta, theme=THEME, css=CUSTOM_CSS,
+        allowed_paths=[str(pasta_pdfs())],
         auth=[(c.login, c.senha) for c in CONTAS] or None,
         auth_message="Entre com o seu usuário da equipe.",
         inbrowser=os.environ.get("EIXOAI_ABRIR_NAVEGADOR", "1") != "0",

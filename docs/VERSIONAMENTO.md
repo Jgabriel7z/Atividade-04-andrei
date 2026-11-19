@@ -142,7 +142,7 @@ Ficou documentado, sem correção: chunks indexados pela versão original não t
 3. A outra pessoa, na aba **Perguntar**: "qual o prazo de reembolso?". A resposta é 30 dias (v1), com o documento e o artigo citados e as fontes ao lado.
 4. Envie `regulamento_v2.pdf` escolhendo "Nova versão de Regulamento Interno". Aparece a seção **Mudanças**: faixa amarela com 3 artigos alterados, 1 removido e 1 incluído, 10 citações diretas em 2 documentos, resumo e a lista de quem é afetado.
 5. A outra pessoa repete a pergunta, sem recarregar: agora é 15 dias (v2).
-6. Em **Histórico**, as duas versões aparecem com quem enviou, quando, motivo e código de verificação (SHA-256). **Comparar** v1 com v2.
+6. Em **Histórico**, as duas versões aparecem com quem enviou, quando, motivo, o link para o PDF de cada uma e o código de verificação (SHA-256). **Comparar** v1 com v2. Em **Documento**, o PDF da versão atual aparece na tela.
 7. Em **Conversa** (do documento) ou na aba **Equipe**, uma pessoa escreve e a outra recebe na hora.
 
 ## Decisões e limites

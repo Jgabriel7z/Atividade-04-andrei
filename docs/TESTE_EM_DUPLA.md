@@ -37,6 +37,11 @@ A aba **Documentos** tem a lista de todos os documentos da equipe, com a versão
 
 O envio virou um lugar só: "Um documento novo" ou "Nova versão de…". O nome sugerido vem do arquivo, legível (`regulamento_v1.pdf` vira "Regulamento").
 
+**Ajustes depois dos prints do João:**
+- **Documento em PDF.** A seção "Texto atual" virou "Documento" e mostra o próprio PDF, com o leitor do navegador. Cada versão guarda o arquivo original em `data/pdfs/<documento>/v<N>.pdf`, ao lado do registro de versões e fora do git, e o Gradio serve essa pasta (`allowed_paths`). Arquivos enviados antes disso mostram o texto extraído, agora em parágrafos. O PDF do edital vinha com uma palavra por linha e uma linha só com espaço entre elas: 1.113 linhas viraram 72 parágrafos.
+- **Histórico.** A tabela do Gradio cortava os títulos e vazava com nome de arquivo comprido. Virou uma tabela própria, que quebra o texto. O nome do arquivo é um link para o PDF daquela versão, e o código de verificação fica embaixo dele.
+- **Formulário de envio.** Os textos de exemplo longos não cabiam e criavam barra de rolagem; agora são curtos, com a explicação em letra pequena. As barras de rolagem da página passaram a ser escuras.
+
 ### 4. Conversa e trabalho em equipe
 Inspirado na "bolinha" que o time da Gravaê usa (feed, recados, presença, novidades desde a última visita), em `src/equipe.py`, no mesmo SQLite das versões:
 - **Conversa geral** (aba Equipe) e **conversa por documento** (aba Documentos › Conversa);

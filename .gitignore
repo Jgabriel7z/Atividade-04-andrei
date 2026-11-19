@@ -214,3 +214,6 @@ data/versions.db
 # Gradio guarda cache e envios aqui
 .gradio/
 src/.gradio/
+
+# PDFs guardados de cada versão (ficam ao lado de data/versions.db)
+data/pdfs/
