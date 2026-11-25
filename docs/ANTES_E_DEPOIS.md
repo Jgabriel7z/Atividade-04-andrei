@@ -1,6 +1,9 @@
 # Antes e depois
 
 As mudanças da Atividade 04, comparadas com o código original (commit `36f10ca`).
+
+> **Versão final:** as capturas abaixo são da primeira rodada (2026-11-09). As da versão entregue estão na seção 7 de [RELATORIO.md](RELATORIO.md), em `docs/img/final/`. Foram tiradas em 2026-11-24, com a LLM respondendo, duas pessoas logadas e as abas Perguntar, Documentos e Equipe.
+
 As capturas foram tiradas com os dois códigos rodando lado a lado, com os mesmos PDFs de `data/exemplos/pdf/` e **sem chave do Groq** nos dois. Por isso a LLM não responde em nenhum deles; o que muda é o que cada um faz sem ela.
 
 ## Na tela
